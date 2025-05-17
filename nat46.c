@@ -5,6 +5,9 @@
 #include <netinet/ip6.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <netinet/tcp.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <bpf/bpf_endian.h>
@@ -27,130 +30,12 @@
 #endif
 
 #define LOG(msg, ...) { static const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
-
-// ipv4 pseudo header (all values in network byte order)
-struct pseudo4 {
-    uint8_t source[4];
-    uint8_t dest[4];
-    uint8_t zero;
-    uint8_t protocol;
-    uint16_t length;
-};
-
-// ipv6 pseudo header (all values in network byte order)
-struct pseudo6 {
-    uint8_t source[16];
-    uint8_t dest[16];
-    uint32_t length;
-    uint8_t zero[3];
-    uint8_t nxthdr;
-};
-
-static __always_inline uint64_t combine_ipv4(uint8_t addr[static 4]) {
-    uint64_t netsum = 0;
-    //netsum += ntohs(((uint16_t)addr[0] << 8) | addr[1]);
-    //netsum += ntohs(((uint16_t)addr[2] << 8) | addr[3]);
-    /* Note: returned in host byte order */
-    return netsum;
-}
-
-static __always_inline uint64_t combine_ipv6(uint8_t addr[static 16]) {
-    uint64_t netsum = 0;
-    netsum += ntohs(((uint16_t)addr[0] << 8) | addr[1]);
-    netsum += ntohs(((uint16_t)addr[2] << 8) | addr[3]);
-    netsum += (((uint16_t)addr[4] << 8) | addr[5]);
-    netsum += ntohs(((uint16_t)addr[6] << 8) | addr[7]);
-    netsum += ntohs(((uint16_t)addr[8] << 8) | addr[9]);
-    netsum += ntohs(((uint16_t)addr[10] << 8) | addr[11]);
-    //netsum += ntohs(((uint16_t)addr[12] << 8) | addr[13]);
-    //netsum += ntohs(((uint16_t)addr[14] << 8) | addr[15]);
-    LOG("v6 addr netsum=%04llx", netsum);
-    /* Note: returned in host byte order */
-    return netsum;
-}
-
-static __always_inline uint16_t pseudo4_netsum(struct pseudo4 pseudo4) {
-    uint64_t netsum = 0;
-    netsum += combine_ipv4(pseudo4.source);
-    netsum += combine_ipv4(pseudo4.dest);
-    //netsum += ntohs((pseudo4.zero << 8) | pseudo4.protocol);
-    //netsum += ntohs(pseudo4.length);
-
-    netsum = (netsum & 0xFFFF) + (netsum >> 16);
-    netsum = (netsum & 0xFFFF) + (netsum >> 16);
-
-    if (netsum > 0xFFFF)
-        LOG("ipv4 netsum not fully wrapped: %lld", netsum);
-
-    /* note: returned in host byte order not network byte order */
-    return netsum;
-}
-
-static __always_inline uint16_t pseudo6_netsum(struct pseudo6 pseudo6) {
-    uint64_t netsum = 0;
-    netsum += combine_ipv6(pseudo6.source);
-    netsum += combine_ipv6(pseudo6.dest);
-    //netsum += ntohs((uint16_t)(pseudo6.length >> 16));
-    //netsum += ntohs((uint16_t)(pseudo6.length & 0xFFFF));
-    //netsum += ntohs((pseudo6.zero[2] << 8) | pseudo6.nxthdr);
-
-    LOG("unfolded netsum=%04lld", netsum);
-    netsum = (netsum & 0xFFFF) + (netsum >> 16);
-    netsum = (netsum & 0xFFFF) + (netsum >> 16);
-    LOG("folded netsum=%04lld", netsum);
-
-    if (netsum > 0xFFFF)
-        LOG("netsum checksum not fully wrapped: %lld", netsum);
-
-    /* note: returned in host byte order not network byte order */
-    return netsum;
-}
-
-static __always_inline uint16_t incremental_update(uint16_t orig_checksum, struct pseudo4 pseudo4, struct pseudo6 pseudo6) {
-
-    uint64_t old = pseudo4_netsum(pseudo4);
-    uint64_t new = pseudo6_netsum(pseudo6);
-
-    LOG("old=%04llx new=%04llx ~new=%04x", old, new, (uint16_t)~new);
-
-    uint64_t checksum = ntohs(orig_checksum) + (uint16_t)old + (uint16_t)~new;
-    checksum = (checksum & 0xFFFF) + (checksum >> 16);
-    checksum = (checksum & 0xFFFF) + (checksum >> 16);
-
-    if (checksum > 0xFFFF) {
-        LOG("Final checksum not wrapped");
-    }
-
-    return htons(checksum);
-}
-
-static __always_inline struct pseudo4 pseudo_from_ipv4(struct ip *ip) {
-    struct pseudo4 ret = (struct pseudo4) {
-            .zero = 0,
-            .protocol = ip->ip_p,
-            .length = htons(ntohs(ip->ip_len) - ip->ip_hl * 4),
-    };
-
-    memcpy(&ret.source, &ip->ip_src.s_addr, sizeof(ret.source));
-    memcpy(&ret.dest, &ip->ip_dst.s_addr, sizeof(ret.dest));
-
-    return ret;
-}
-
-static __always_inline struct pseudo6 pseudo_from_ipv6(struct ip6_hdr *ip6) {
-    struct pseudo6 pseudo6;
-    pseudo6.length = ip6->ip6_plen;
-    memzero(&pseudo6.zero, sizeof(pseudo6.zero));
-    pseudo6.nxthdr = ip6->ip6_nxt;
-    memcpy(&pseudo6.source, &ip6->ip6_src, sizeof(pseudo6.source));
-    memcpy(&pseudo6.dest, &ip6->ip6_dst, sizeof(pseudo6.dest));
-
-    return pseudo6;
-}
+#define LOG_IF(cond, msg, ...) do { if (cond) LOG(msg, ##__VA_ARGS__); } while(0)
 
 static __always_inline int pop_header(struct xdp_md *ctx, size_t hdr_size) {
     return bpf_xdp_adjust_head(ctx, hdr_size);
 }
+
 
 static __always_inline int push_header(struct xdp_md *ctx, void *hdr, size_t hdr_size) {
     int ret = bpf_xdp_adjust_head(ctx, -hdr_size);
@@ -164,24 +49,148 @@ static __always_inline int push_header(struct xdp_md *ctx, void *hdr, size_t hdr
     return 0;
 }
 
+
 static __always_inline void *get_header(struct xdp_md *ctx, size_t hdr_size) {
     if (ctx->data + hdr_size > ctx->data_end)
         return NULL;
     return (void *)(unsigned long)ctx->data;
 }
 
-static __always_inline int process_udp(struct xdp_md *ctx, struct pseudo4 *pseudo4, struct pseudo6 *pseudo6) {
+
+static __always_inline uint16_t u16_combine(uint8_t hi, uint8_t lo) {
+    return ntohs(((uint16_t)hi << 8) | lo);
+}
+
+
+static __always_inline uint32_t pseudo_netsum_from_ipv4(struct ip *ip) {
+    uint32_t netsum = 0;
+    /* skipping the source address */
+    /* skipping the destination address */
+
+    netsum += u16_combine(0, ip->ip_p);
+    netsum += ntohs(ip->ip_len) - ip->ip_hl * 4; // ip payload length
+
+    return netsum;
+}
+
+
+static __always_inline uint32_t pseudo_netsum_from_ipv6(struct ip6_hdr *ip6) {
+    uint32_t netsum = 0;
+    // add the new ipv6 source address fields (but skip the last 2 words, as
+    // they're the same as the v4 address
+    netsum += ntohs(ip6->ip6_src.s6_addr16[0]);
+    netsum += ntohs(ip6->ip6_src.s6_addr16[1]);
+    netsum += ntohs(ip6->ip6_src.s6_addr16[2]);
+    netsum += ntohs(ip6->ip6_src.s6_addr16[3]);
+    netsum += ntohs(ip6->ip6_src.s6_addr16[4]);
+    netsum += ntohs(ip6->ip6_src.s6_addr16[5]);
+    /* note: not last 2 words */
+
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[0]);
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[1]);
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[2]);
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[3]);
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[4]);
+    netsum += ntohs(ip6->ip6_dst.s6_addr16[5]);
+    /* note: not last 4 bytes */
+
+    /* payload length */
+    netsum += ntohl(ip6->ip6_plen) >> 16;
+    netsum += ntohl(ip6->ip6_plen) & 0xFFFF;
+
+    netsum += u16_combine(0, 0); // zeros
+    netsum += u16_combine(0, ip6->ip6_nxt);
+
+    return netsum;
+}
+
+
+static __always_inline void apply_checksum_fixup(uint16_t *checksum, uint32_t old, uint32_t new) {
+    LOG("%04x -> %04x", old, new);
+    old = (old & 0xFFFF) + (old >> 16);
+    old = (old & 0xFFFF) + (old >> 16);
+    new = (new & 0xFFFF) + (new >> 16);
+    new = (new & 0xFFFF) + (new >> 16);
+    LOG("%04x -w> %04x", old, new);
+
+    LOG_IF(old > 0xFFFF, "old not fully wrapped: %04x", old);
+    LOG_IF(new > 0xFFFF, "new not fully wrapped: %04x", new);
+
+    uint32_t update = ntohs(*checksum) + old + (uint16_t)~new;
+    update = (update & 0xFFFF) + (update >> 16);
+    update = (update & 0xFFFF) + (update >> 16);
+
+    LOG_IF(update > 0xFFFF, "old not fully wrapped: %04x", update);
+    *checksum = htons(update);
+}
+
+
+static __always_inline int process_icmp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
+    struct icmphdr *icmp = NULL;
+    if (!(icmp = get_header(ctx, sizeof(struct icmphdr)))) {
+        LOG("unable to get icmp header");
+        return XDP_PASS;
+    }
+
+    old_netsum += u16_combine(icmp->type, icmp->code);
+
+    switch (icmp->type) {
+        case ICMP_ECHOREPLY:
+            icmp->type = ICMP6_ECHO_REPLY;
+            break;
+        case ICMP_DEST_UNREACH: /* TODO */
+        case ICMP_TIME_EXCEEDED: /* TODO */
+            return XDP_DROP;
+        case ICMP_ECHO:
+            icmp->type = ICMP6_ECHO_REQUEST;
+            break;
+        /* Single hop messages, not routed */
+        case 9: /* Router Advertisement - Single hop */
+        case 10: /* Router solicitation - Single hop */
+            return XDP_DROP;
+        /* Obsolete messages */
+        case ICMP_TIMESTAMP:
+        case ICMP_TIMESTAMPREPLY:
+        case ICMP_INFO_REQUEST:
+        case ICMP_INFO_REPLY:
+        case ICMP_ADDRESS:
+        case ICMP_ADDRESSREPLY:
+            return XDP_DROP;
+        default: /* Unknown */
+            return XDP_DROP;
+    }
+
+    new_netsum += u16_combine(icmp->type, icmp->code);
+
+    apply_checksum_fixup(&icmp->checksum, old_netsum, new_netsum);
+
+    return XDP_TX;
+}
+
+
+static __always_inline int process_tcp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
+    struct tcphdr *tcp = NULL;
+    if (!(tcp = get_header(ctx, sizeof(struct tcphdr)))) {
+        return XDP_PASS;
+    }
+
+    apply_checksum_fixup(&tcp->check, old_netsum, new_netsum);
+
+    return XDP_TX;
+}
+
+
+static __always_inline int process_udp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
     struct udphdr *udp = NULL;
     if (!(udp = get_header(ctx, sizeof(struct udphdr)))) {
         return XDP_PASS;
     }
 
-    LOG("Old checksum=%04x", ntohs(udp->check));
-    udp->check = incremental_update(udp->check, *pseudo4, *pseudo6);
-    LOG("New checksum=%04x", ntohs(udp->check));
+    apply_checksum_fixup(&udp->check, old_netsum, new_netsum);
 
     return XDP_TX;
 }
+
 
 static __always_inline int process_ipv4(struct xdp_md *ctx) {
     struct ip *iphdr = NULL;
@@ -197,10 +206,12 @@ static __always_inline int process_ipv4(struct xdp_md *ctx) {
     ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
     ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
     ip6hdr.ip6_hlim = iphdr->ip_ttl;
-    ip6hdr.ip6_nxt = protocol;
+    ip6hdr.ip6_nxt = (protocol == IPPROTO_ICMP) ? IPPROTO_ICMPV6 : protocol;
+    //ip6hdr.ip6_nxt = protocol;
 
     uint32_t v4_src = ntohl(iphdr->ip_src.s_addr);
     uint32_t v4_dst = ntohl(iphdr->ip_dst.s_addr);
+    /* TODO: These arrays should probably be uint16_t's rather than uint8_ts */
     uint8_t v6_dst[16] = {
         0x00,0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00,
         0x00,0x00, 0x00, 0x00, (v4_dst >> 24) & 0xFF, (v4_dst >> 16) & 0xFF, (v4_dst >> 8) & 0xFF, (v4_dst & 0xFF)
@@ -213,31 +224,44 @@ static __always_inline int process_ipv4(struct xdp_md *ctx) {
     memcpy(&ip6hdr.ip6_dst, v6_dst, sizeof(ip6hdr.ip6_dst));
     memcpy(&ip6hdr.ip6_src, v6_src, sizeof(ip6hdr.ip6_src));
 
-    /* pseudo header */
-    struct pseudo4 pseudo4 = pseudo_from_ipv4(iphdr);
-    struct pseudo6 pseudo6 = pseudo_from_ipv6(&ip6hdr);
+    uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6hdr);
 
     /* TODO: Handle fragmented IPv4 packet */
 
     /* Strip off the old IPv4 header */
-    if (pop_header(ctx, sizeof(struct ip)) < 0)
+    if (pop_header(ctx, sizeof(struct ip)) < 0) {
+        LOG("failed to pop v4 header");
         return XDP_PASS;
+    }
 
     /* Handle any inner protocols that need handling */
     switch (protocol) {
         int ret;
         case IPPROTO_ICMP:
-            /* TODO */
+            if ((ret = process_icmp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
             break;
         case IPPROTO_UDP:
-            if ((ret = process_udp(ctx, &pseudo4, &pseudo6)) != XDP_TX)
+            if ((ret = process_udp(ctx, old_netsum, new_netsum)) != XDP_TX)
                 return ret;
+            break;
+        case IPPROTO_TCP:
+            if ((ret = process_tcp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+
+        /* These don't need fixups */
+        case IPPROTO_AH:
+        case IPPROTO_ESP:
             break;
     }
 
     /* Push on the new IPv6 header */
-    if (push_header(ctx, &ip6hdr, sizeof(ip6hdr)) < 0)
+    if (push_header(ctx, &ip6hdr, sizeof(ip6hdr)) < 0) {
+        LOG("failed to push v6 header");
         return XDP_DROP;
+    }
 
     /* Send the packet out the incoming interface */
     LOG("rewrite done");
