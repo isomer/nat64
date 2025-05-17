@@ -8,10 +8,12 @@ ip link del veth0 || true
 
 ip link add $DEV type veth
 
+# Disable checksum offload.  Possibly only needed for debugging checksums
+ethtool -K veth0 tx-checksumming off rx-checksumming off
+
 #xdp-loader load -m skb $DEV nat46.o
 #ip link set dev $DEV xdp object nat46.o program xdp_4to6 verbose
 ip link set dev $DEV xdpgeneric obj nat46.o sec xdp verbose
-
 
 ip link set up dev $DEV
 ip addr add 10.0.1.1/24 dev $DEV
