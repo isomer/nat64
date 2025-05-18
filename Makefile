@@ -7,7 +7,7 @@ all: nat46.o
 	$(CLANG) -S \
 		-target bpf \
 		-D __BPF_TRACING__ \
-		-Wall \
+		-Wall -Wextra -Wstrict-prototypes -Wmissing-prototypes \
 		-O2 -emit-llvm -c -g -o ${@:.o=.ll} $<
 	$(LLC) -march bpf -filetype obj -o $@ ${@:.o=.ll}
 

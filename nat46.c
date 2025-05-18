@@ -58,7 +58,7 @@ static __always_inline void *get_header(struct xdp_md *ctx, size_t hdr_size) {
 
 
 static __always_inline uint16_t u16_combine(uint8_t hi, uint8_t lo) {
-    return ntohs(((uint16_t)hi << 8) | lo);
+    return ((uint16_t)hi << 8) | lo;
 }
 
 
@@ -84,25 +84,26 @@ static __always_inline uint32_t pseudo_netsum_from_ipv6(struct ip6_hdr *ip6) {
     }
 
     /* payload length */
-    netsum += ntohl(ip6->ip6_plen) >> 16;
-    netsum += ntohl(ip6->ip6_plen) & 0xFFFF;
+    netsum += ntohs(ip6->ip6_plen) >> 16; // This will always be zero, because v4 doesn't support jumbo frames
+    netsum += ntohs(ip6->ip6_plen) & 0xFFFF;
 
     netsum += u16_combine(0, 0); // zeros
     netsum += u16_combine(0, ip6->ip6_nxt);
+
+    netsum = (netsum >> 16) + (netsum & 0xFFFF);
+    LOG("plen: %d  nxt: %d", ntohs(ip6->ip6_plen), ip6->ip6_nxt);
+
+    LOG("pseudo6 netsum: 0x%04x", netsum);
 
     return netsum;
 }
 
 
 static __always_inline void apply_checksum_fixup(uint16_t *checksum, uint32_t old, uint32_t new) {
-    LOG("prev=%04x", ntohs(*checksum));
-    LOG("%04x -> %04x", old, new);
     old = (old & 0xFFFF) + (old >> 16);
     old = (old & 0xFFFF) + (old >> 16);
     new = (new & 0xFFFF) + (new >> 16);
     new = (new & 0xFFFF) + (new >> 16);
-    LOG("%04x -w> %04x", old, new);
-    LOG("%04x => %04x", (uint16_t)~new, old + (uint16_t)~new);
 
     LOG_IF(old > 0xFFFF, "old not fully wrapped: %04x", old);
     LOG_IF(new > 0xFFFF, "new not fully wrapped: %04x", new);
@@ -111,29 +112,86 @@ static __always_inline void apply_checksum_fixup(uint16_t *checksum, uint32_t ol
     update = (update & 0xFFFF) + (update >> 16);
     update = (update & 0xFFFF) + (update >> 16);
     LOG_IF(update > 0xFFFF, "update not fully wrapped: %04x", update);
+    LOG("prev: 0x%04x", ntohs(*checksum));
+    LOG("old: 0x%04x -> new: 0x%04x", old, new);
+    LOG("incremental: 0x%04x", update);
 
     *checksum = htons(update);
 }
 
 
+static __always_inline uint16_t netsum_final(uint32_t netsum) {
+    netsum = (netsum >> 16) + (netsum & 0xFFFF);
+    netsum = (netsum >> 16) + (netsum & 0xFFFF);
+    LOG_IF(netsum > 0xFFFF, "netsum %04x not folded", netsum);
+    return htons(~(uint16_t)netsum);
+}
+
+
 static __always_inline int process_icmp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
+    uint32_t pseudo_netsum = new_netsum;
+    LOG("pseudo header checksum: 0x%04x", pseudo_netsum);
     struct icmphdr *icmp = NULL;
     if (!(icmp = get_header(ctx, sizeof(struct icmphdr)))) {
         LOG("unable to get icmp header");
         return XDP_PASS;
     }
 
+    {
+        uint16_t old_checksum = icmp->checksum;
+        icmp->checksum = htons(0);
+        uint16_t *data = get_header(ctx, 64);
+        if (data) {
+            uint32_t netsum = 0;
+            netsum += htons(data[0]);
+            netsum += htons(data[1]);
+            netsum += htons(data[2]);
+            netsum += htons(data[3]);
+            netsum += htons(data[4]);
+            netsum += htons(data[5]);
+            netsum += htons(data[6]);
+            netsum += htons(data[7]);
+            netsum += htons(data[8]);
+            netsum += htons(data[9]);
+            netsum += htons(data[10]);
+            netsum += htons(data[11]);
+            netsum += htons(data[12]);
+            netsum += htons(data[13]);
+            netsum += htons(data[14]);
+            netsum += htons(data[15]);
+            netsum += htons(data[16]);
+            netsum += htons(data[17]);
+            netsum += htons(data[18]);
+            netsum += htons(data[19]);
+            netsum += htons(data[20]);
+            netsum += htons(data[21]);
+            netsum += htons(data[22]);
+            netsum += htons(data[23]);
+            netsum += htons(data[24]);
+            netsum += htons(data[25]);
+            netsum += htons(data[26]);
+            netsum += htons(data[27]);
+            netsum += htons(data[28]);
+            netsum += htons(data[29]);
+            netsum += htons(data[30]);
+            netsum += htons(data[31]);
+
+            LOG("calculated checksum: %04x  icmp->checksum: %04x", ntohs(netsum_final(netsum)), ntohs(old_checksum));
+        }
+        icmp->checksum = old_checksum;
+    }
+
     old_netsum += u16_combine(icmp->type, icmp->code);
 
     switch (icmp->type) {
         case ICMP_ECHOREPLY:
-            //icmp->type = ICMP6_ECHO_REPLY;
+            icmp->type = ICMP6_ECHO_REPLY;
             break;
         case ICMP_DEST_UNREACH: /* TODO */
         case ICMP_TIME_EXCEEDED: /* TODO */
             return XDP_DROP;
         case ICMP_ECHO:
-            //icmp->type = ICMP6_ECHO_REQUEST;
+            icmp->type = ICMP6_ECHO_REQUEST;
             break;
         /* Single hop messages, not routed */
         case 9: /* Router Advertisement - Single hop */
@@ -154,6 +212,51 @@ static __always_inline int process_icmp(struct xdp_md *ctx, uint32_t old_netsum,
     }
 
     new_netsum += u16_combine(icmp->type, icmp->code);
+
+    {
+        uint16_t old_checksum = icmp->checksum;
+        icmp->checksum = htons(0);
+        LOG("len: %d", ctx->data_end - ctx->data);
+        uint16_t *data = get_header(ctx, 64);
+        if (data) {
+            uint32_t netsum = pseudo_netsum;
+            netsum += htons(data[0]);
+            netsum += htons(data[1]);
+            netsum += htons(data[2]);
+            netsum += htons(data[3]);
+            netsum += htons(data[4]);
+            netsum += htons(data[5]);
+            netsum += htons(data[6]);
+            netsum += htons(data[7]);
+            netsum += htons(data[8]);
+            netsum += htons(data[9]);
+            netsum += htons(data[10]);
+            netsum += htons(data[11]);
+            netsum += htons(data[12]);
+            netsum += htons(data[13]);
+            netsum += htons(data[14]);
+            netsum += htons(data[15]);
+            netsum += htons(data[16]);
+            netsum += htons(data[17]);
+            netsum += htons(data[18]);
+            netsum += htons(data[19]);
+            netsum += htons(data[20]);
+            netsum += htons(data[21]);
+            netsum += htons(data[22]);
+            netsum += htons(data[23]);
+            netsum += htons(data[24]);
+            netsum += htons(data[25]);
+            netsum += htons(data[26]);
+            netsum += htons(data[27]);
+            netsum += htons(data[28]);
+            netsum += htons(data[29]);
+            netsum += htons(data[30]);
+            netsum += htons(data[31]);
+
+            LOG("new calculated checksum: 0x%04x", ntohs(netsum_final(netsum)));
+        }
+        icmp->checksum = old_checksum;
+    }
 
     apply_checksum_fixup(&icmp->checksum, old_netsum, new_netsum);
 
@@ -197,21 +300,31 @@ static __always_inline int process_ipv4(struct xdp_md *ctx) {
     struct ip6_hdr ip6hdr;
     ip6hdr.ip6_flow = 0x0; /* TODO: Copy traffic control bits */
     ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
-    LOG("ip_len=%04x", ntohs(iphdr->ip_len));
     ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
     ip6hdr.ip6_hlim = iphdr->ip_ttl;
     ip6hdr.ip6_nxt = (protocol == IPPROTO_ICMP) ? IPPROTO_ICMPV6 : protocol;
 
     uint32_t v4_src = ntohl(iphdr->ip_src.s_addr);
     uint32_t v4_dst = ntohl(iphdr->ip_dst.s_addr);
-    /* TODO: These arrays should probably be uint16_t's rather than uint8_ts */
-    uint8_t v6_src[16] = {
-        0x00,0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00,
-        0x00,0x00, 0x00, 0x00, (v4_src >> 24) & 0xFF, (v4_src >> 16) & 0xFF, (v4_src >> 8) & 0xFF, (v4_src & 0xFF)
+    uint16_t v6_src[8] = {
+        htons(0x0064),
+        htons(0xff9b),
+        htons(0x0001),
+        htons(0x0000),
+        htons(0x0000),
+        htons(0x0000),
+        htons((v4_src >> 16) & 0xFFFF),
+        htons(v4_src & 0xFFFF),
     };
-    uint8_t v6_dst[16] = {
-        0x00,0x64, 0xff, 0x9b, 0x00, 0x01, 0x00, 0x00,
-        0x00,0x00, 0x00, 0x00, (v4_dst >> 24) & 0xFF, (v4_dst >> 16) & 0xFF, (v4_dst >> 8) & 0xFF, (v4_dst & 0xFF)
+    uint16_t v6_dst[8] = {
+        htons(0x0064),
+        htons(0xff9b),
+        htons(0x0001),
+        htons(0x0000),
+        htons(0x0000),
+        htons(0x0000),
+        htons((v4_dst >> 16) & 0xFFFF),
+        htons(v4_dst & 0xFFFF),
     };
 
     memcpy(&ip6hdr.ip6_dst, v6_dst, sizeof(ip6hdr.ip6_dst));
@@ -302,6 +415,7 @@ static __always_inline int process_ethernet(struct xdp_md *ctx) {
     }
 }
 
+extern int xdp_4to6(struct xdp_md *ctx);
 
 SEC("xdp")
 int xdp_4to6(struct xdp_md *ctx) {
