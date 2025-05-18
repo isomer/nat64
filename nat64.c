@@ -13,6 +13,8 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+static const uint8_t magic_ether[ETH_ALEN] = { 02, 00, 00, 00, 00, 0x64 };
+
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
@@ -60,6 +62,24 @@ static __always_inline void *get_header(struct xdp_md *ctx, size_t hdr_size) {
 
 static __always_inline uint16_t u16_combine(uint8_t hi, uint8_t lo) {
     return ((uint16_t)hi << 8) | lo;
+}
+
+
+static __always_inline uint32_t partial_netsum(uint8_t *data, size_t len) {
+    uint32_t netsum = 0;
+
+    for(size_t i = 0; i < len; i += 2) {
+        netsum += u16_combine(data[i], data[i+1]);
+    }
+
+    return netsum;
+}
+
+
+static __always_inline uint16_t finalise_netsum(uint32_t netsum) {
+    netsum = (netsum >> 16) + (netsum & 0xFFFF);
+    netsum = (netsum >> 16) + (netsum & 0xFFFF);
+    return htons(netsum);
 }
 
 
@@ -183,6 +203,20 @@ static __always_inline int process_udp(struct xdp_md *ctx, uint32_t old_netsum, 
     return XDP_TX;
 }
 
+static __always_inline struct in_addr lookup_v6(uint8_t addr[static 16]) {
+    static const uint8_t prefix[] = { 0x00, 0x64, 0xFF, 0x9B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    if (memcmp(addr, prefix, sizeof(prefix)) == 0) {
+        /* This is an IPv4 embedded in a v6 address, unpack it. */
+        return (struct in_addr) {
+            .s_addr = *(uint32_t*)&addr[12],
+        };
+    }
+
+    /* Lets use a dummy address for now*/
+    return (struct in_addr) {
+        .s_addr = htonl(0x0a000004),
+    };
+}
 
 static __always_inline int process_ipv4(struct xdp_md *ctx) {
     struct ip *iphdr = NULL;
@@ -272,23 +306,92 @@ static __always_inline int process_ipv4(struct xdp_md *ctx) {
 }
 
 
+static __always_inline int process_ipv6(struct xdp_md *ctx) {
+    struct ip6_hdr *ip6 = NULL;
+
+    if (!(ip6 = get_header(ctx, sizeof(struct ip6_hdr))))
+        return XDP_PASS;
+
+    /* Construct a new IPv4 header based on the existing IPv6 header */
+    uint8_t protocol = ip6->ip6_nxt;
+    struct ip ip;
+
+    ip.ip_v = 0x4;
+    ip.ip_hl = 20/4;
+    ip.ip_tos = 0x00; /* TODO: Copy traffic control bits */
+    ip.ip_len = ntohs(ip6->ip6_plen) + ip.ip_hl * 4;
+    ip.ip_id = 0x00; /* TODO: Handle fragmentation */
+    ip.ip_off = 0x00; // TODO: Handle fragmentation
+    ip.ip_ttl = ip6->ip6_hlim;
+    ip.ip_p = (protocol == IPPROTO_ICMPV6) ? IPPROTO_ICMP : protocol;
+    ip.ip_sum = 0x00;
+    ip.ip_src = lookup_v6(ip6->ip6_src.s6_addr);
+    ip.ip_dst = lookup_v6(ip6->ip6_dst.s6_addr);
+    ip.ip_sum = finalise_netsum(partial_netsum((void*)&ip, sizeof(ip)));
+
+    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip);
+    uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
+
+    /* TODO: Handle fragmented IPv4 packet */
+
+    /* Strip off the old IPv4 header */
+    if (pop_header(ctx, sizeof(struct ip6_hdr)) < 0) {
+        LOG("failed to pop v6 header");
+        return XDP_PASS;
+    }
+
+    /* Handle any inner protocols that need handling */
+    switch (protocol) {
+        int ret;
+#if 0
+        case IPPROTO_ICMP:
+            if ((ret = process_icmp(ctx, 0 /* icmp4 has no pseudo header */, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+#endif
+        case IPPROTO_TCP:
+            if ((ret = process_tcp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+        case IPPROTO_UDP:
+            if ((ret = process_udp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+
+        /* These don't need fixups */
+        case IPPROTO_AH:
+        case IPPROTO_ESP:
+        case IPPROTO_SCTP:
+            break;
+    }
+
+    /* Push on the new IPv6 header */
+    if (push_header(ctx, &ip, sizeof(ip)) < 0) {
+        LOG("failed to push v6 header");
+        return XDP_DROP;
+    }
+
+    /* Send the packet out the incoming interface */
+    LOG("rewrite done");
+    return XDP_TX;
+}
+
+
 static __always_inline int process_ethernet(struct xdp_md *ctx) {
-    static const uint8_t magic_ether[ETH_ALEN] = { 02, 00, 00, 00, 00, 0x46 };
     struct ether_header *ethhdr = NULL;
-    struct ether_header newhdr;
 
     if (!(ethhdr = get_header(ctx, sizeof(struct ether_header)))) {
         LOG("packet missing ethernet header");
         return XDP_PASS;
     }
 
-    if (ntohs(ethhdr->ether_type) == ETHERTYPE_IP
-            && memcmp(magic_ether, ethhdr->ether_dhost, sizeof(magic_ether)) == 0) {
-
-        /* Build a new header based on the old header */
+    /* Is this to the magic ethernet address? */
+    if (memcmp(magic_ether, ethhdr->ether_dhost, sizeof(magic_ether)) == 0) {
+        struct ether_header newhdr;
+        /* Build a new header */
         memcpy(newhdr.ether_dhost, ethhdr->ether_shost, ETH_ALEN);
         memcpy(newhdr.ether_shost, ethhdr->ether_dhost, ETH_ALEN);
-        newhdr.ether_type = htons(ETHERTYPE_IPV6);
+        newhdr.ether_type = ethhdr->ether_type;
 
         /* Discard the old header */
         if (pop_header(ctx, sizeof(newhdr)) < 0) {
@@ -296,25 +399,41 @@ static __always_inline int process_ethernet(struct xdp_md *ctx) {
             return XDP_PASS;
         }
 
-        /* Process the remaining */
-        int ret = process_ipv4(ctx);
+        int ret = XDP_DROP;
 
-        /* Now push our new ethernet header back on the front */
-        if (push_header(ctx, &newhdr, sizeof(newhdr)) < 0) {
-                LOG("couldn't push ethernet header");
+        switch (ntohs(newhdr.ether_type)) {
+            case ETHERTYPE_IP:
+                newhdr.ether_type = htons(ETHERTYPE_IPV6);
+                ret = process_ipv4(ctx);
+                break;
+
+            case ETHERTYPE_IPV6:
+                newhdr.ether_type = htons(ETHERTYPE_IP);
+                ret = process_ipv6(ctx);
+                break;
+
+            default:
                 return XDP_DROP;
         }
 
+        /* Now push our new ethernet header back on the front */
+        if (push_header(ctx, &newhdr, sizeof(newhdr)) < 0) {
+            LOG("couldn't push ethernet header");
+            return XDP_DROP;
+        }
+        LOG("Done with status %d\n", ret);
         return ret;
     } else {
+        //LOG("Packet not to magic ethernet address, ignoring.");
+        //TODO: We should increment a counter here
         return XDP_PASS;
     }
 }
 
-extern int xdp_4to6(struct xdp_md *ctx);
+extern int xdp_nat64(struct xdp_md *ctx);
 
 SEC("xdp")
-int xdp_4to6(struct xdp_md *ctx) {
+int xdp_nat64(struct xdp_md *ctx) {
     return process_ethernet(ctx);
 }
 

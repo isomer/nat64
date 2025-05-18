@@ -1,7 +1,7 @@
 CLANG?=clang
 LLC?=llc
 
-all: nat46.o
+all: nat64.o
 
 %.o: %.c
 	$(CLANG) -S \
