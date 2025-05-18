@@ -32,6 +32,7 @@
 #define LOG(msg, ...) { static const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
 #define LOG_IF(cond, msg, ...) do { if (cond) LOG(msg, ##__VA_ARGS__); } while(0)
 
+
 static __always_inline int pop_header(struct xdp_md *ctx, size_t hdr_size) {
     return bpf_xdp_adjust_head(ctx, hdr_size);
 }
