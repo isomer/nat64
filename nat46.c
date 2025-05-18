@@ -91,9 +91,6 @@ static __always_inline uint32_t pseudo_netsum_from_ipv6(struct ip6_hdr *ip6) {
     netsum += u16_combine(0, ip6->ip6_nxt);
 
     netsum = (netsum >> 16) + (netsum & 0xFFFF);
-    LOG("plen: %d  nxt: %d", ntohs(ip6->ip6_plen), ip6->ip6_nxt);
-
-    LOG("pseudo6 netsum: 0x%04x", netsum);
 
     return netsum;
 }
@@ -112,73 +109,16 @@ static __always_inline void apply_checksum_fixup(uint16_t *checksum, uint32_t ol
     update = (update & 0xFFFF) + (update >> 16);
     update = (update & 0xFFFF) + (update >> 16);
     LOG_IF(update > 0xFFFF, "update not fully wrapped: %04x", update);
-    LOG("prev: 0x%04x", ntohs(*checksum));
-    LOG("old: 0x%04x -> new: 0x%04x", old, new);
-    LOG("incremental: 0x%04x", update);
 
     *checksum = htons(update);
 }
 
 
-static __always_inline uint16_t netsum_final(uint32_t netsum) {
-    netsum = (netsum >> 16) + (netsum & 0xFFFF);
-    netsum = (netsum >> 16) + (netsum & 0xFFFF);
-    LOG_IF(netsum > 0xFFFF, "netsum %04x not folded", netsum);
-    return htons(~(uint16_t)netsum);
-}
-
-
 static __always_inline int process_icmp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
-    uint32_t pseudo_netsum = new_netsum;
-    LOG("pseudo header checksum: 0x%04x", pseudo_netsum);
     struct icmphdr *icmp = NULL;
     if (!(icmp = get_header(ctx, sizeof(struct icmphdr)))) {
         LOG("unable to get icmp header");
         return XDP_PASS;
-    }
-
-    {
-        uint16_t old_checksum = icmp->checksum;
-        icmp->checksum = htons(0);
-        uint16_t *data = get_header(ctx, 64);
-        if (data) {
-            uint32_t netsum = 0;
-            netsum += htons(data[0]);
-            netsum += htons(data[1]);
-            netsum += htons(data[2]);
-            netsum += htons(data[3]);
-            netsum += htons(data[4]);
-            netsum += htons(data[5]);
-            netsum += htons(data[6]);
-            netsum += htons(data[7]);
-            netsum += htons(data[8]);
-            netsum += htons(data[9]);
-            netsum += htons(data[10]);
-            netsum += htons(data[11]);
-            netsum += htons(data[12]);
-            netsum += htons(data[13]);
-            netsum += htons(data[14]);
-            netsum += htons(data[15]);
-            netsum += htons(data[16]);
-            netsum += htons(data[17]);
-            netsum += htons(data[18]);
-            netsum += htons(data[19]);
-            netsum += htons(data[20]);
-            netsum += htons(data[21]);
-            netsum += htons(data[22]);
-            netsum += htons(data[23]);
-            netsum += htons(data[24]);
-            netsum += htons(data[25]);
-            netsum += htons(data[26]);
-            netsum += htons(data[27]);
-            netsum += htons(data[28]);
-            netsum += htons(data[29]);
-            netsum += htons(data[30]);
-            netsum += htons(data[31]);
-
-            LOG("calculated checksum: %04x  icmp->checksum: %04x", ntohs(netsum_final(netsum)), ntohs(old_checksum));
-        }
-        icmp->checksum = old_checksum;
     }
 
     old_netsum += u16_combine(icmp->type, icmp->code);
@@ -212,51 +152,6 @@ static __always_inline int process_icmp(struct xdp_md *ctx, uint32_t old_netsum,
     }
 
     new_netsum += u16_combine(icmp->type, icmp->code);
-
-    {
-        uint16_t old_checksum = icmp->checksum;
-        icmp->checksum = htons(0);
-        LOG("len: %d", ctx->data_end - ctx->data);
-        uint16_t *data = get_header(ctx, 64);
-        if (data) {
-            uint32_t netsum = pseudo_netsum;
-            netsum += htons(data[0]);
-            netsum += htons(data[1]);
-            netsum += htons(data[2]);
-            netsum += htons(data[3]);
-            netsum += htons(data[4]);
-            netsum += htons(data[5]);
-            netsum += htons(data[6]);
-            netsum += htons(data[7]);
-            netsum += htons(data[8]);
-            netsum += htons(data[9]);
-            netsum += htons(data[10]);
-            netsum += htons(data[11]);
-            netsum += htons(data[12]);
-            netsum += htons(data[13]);
-            netsum += htons(data[14]);
-            netsum += htons(data[15]);
-            netsum += htons(data[16]);
-            netsum += htons(data[17]);
-            netsum += htons(data[18]);
-            netsum += htons(data[19]);
-            netsum += htons(data[20]);
-            netsum += htons(data[21]);
-            netsum += htons(data[22]);
-            netsum += htons(data[23]);
-            netsum += htons(data[24]);
-            netsum += htons(data[25]);
-            netsum += htons(data[26]);
-            netsum += htons(data[27]);
-            netsum += htons(data[28]);
-            netsum += htons(data[29]);
-            netsum += htons(data[30]);
-            netsum += htons(data[31]);
-
-            LOG("new calculated checksum: 0x%04x", ntohs(netsum_final(netsum)));
-        }
-        icmp->checksum = old_checksum;
-    }
 
     apply_checksum_fixup(&icmp->checksum, old_netsum, new_netsum);
 
