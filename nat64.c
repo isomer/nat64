@@ -134,6 +134,144 @@ static __always_inline void apply_checksum_fixup(uint16_t *checksum, uint32_t ol
 }
 
 
+static __always_inline struct in6_addr remap_v4_to_v6(struct in_addr addr) {
+    struct in6_addr ret;
+    memcpy(ret.s6_addr, v6_prefix, sizeof(v6_prefix));
+    ret.s6_addr32[3] = addr.s_addr;
+    return ret;
+}
+
+
+static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
+    if (memcmp(addr.s6_addr, v6_prefix, sizeof(v6_prefix)) == 0) {
+        /* This is an IPv4 embedded in a v6 address, unpack it. */
+        return (struct in_addr) {
+            .s_addr = addr.s6_addr32[3],
+        };
+    }
+
+    /* Lets use a dummy address for now*/
+    return (struct in_addr) {
+        .s_addr = *(uint32_t*)&ipv4_addr[0],
+    };
+}
+
+
+static __always_inline struct ip construct_v4_from_v6(struct ip6_hdr *ip6) {
+    struct ip ip;
+
+    ip.ip_v = 0x4;
+    ip.ip_hl = 20/4;
+    ip.ip_tos = 0x00; /* TODO: Copy traffic control bits */
+    ip.ip_len = htons(ntohs(ip6->ip6_plen) + ip.ip_hl * 4);
+    ip.ip_id = 0x00; /* TODO: Handle fragmentation */
+    ip.ip_off = 0x00; // TODO: Handle fragmentation
+    ip.ip_ttl = ip6->ip6_hlim;
+    ip.ip_p = (ip6->ip6_nxt == IPPROTO_ICMPV6) ? IPPROTO_ICMP : ip6->ip6_nxt;
+    ip.ip_sum = 0x0000;
+    ip.ip_src = remap_v6_to_v4(ip6->ip6_src);
+    ip.ip_dst = remap_v6_to_v4(ip6->ip6_dst);
+    ip.ip_sum = finalise_netsum(partial_netsum((void*)&ip, sizeof(ip)));
+
+    return ip;
+}
+
+
+static __always_inline struct ip6_hdr construct_v6_from_v4(struct ip *iphdr) {
+    /* Construct a new IPv6 header based on the existing ipv4 header */
+    struct ip6_hdr ip6hdr;
+    ip6hdr.ip6_flow = 0x0; /* TODO: Copy traffic control bits */
+    ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
+    ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
+    ip6hdr.ip6_hlim = iphdr->ip_ttl;
+    ip6hdr.ip6_nxt = (iphdr->ip_p == IPPROTO_ICMP) ? IPPROTO_ICMPV6 : iphdr->ip_p;
+    ip6hdr.ip6_src = remap_v4_to_v6(iphdr->ip_src);
+    ip6hdr.ip6_dst = remap_v4_to_v6(iphdr->ip_dst);
+
+    return ip6hdr;
+}
+
+static __always_inline int process_udp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
+    struct udphdr *udp = NULL;
+    if (!(udp = get_header(ctx, sizeof(struct udphdr)))) {
+        return XDP_PASS;
+    }
+
+    apply_checksum_fixup(&udp->check, old_netsum, new_netsum);
+
+    return XDP_TX;
+}
+
+
+static __always_inline int process_tcp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
+    struct tcphdr *tcp = NULL;
+    if (!(tcp = get_header(ctx, sizeof(struct tcphdr)))) {
+        return XDP_PASS;
+    }
+
+    apply_checksum_fixup(&tcp->check, old_netsum, new_netsum);
+
+    return XDP_TX;
+}
+
+
+static __always_inline int process_quoted6(struct xdp_md *ctx) {
+    struct ip6_hdr *ip6 = NULL;
+
+    if (!(ip6 = get_header(ctx, sizeof(struct ip6_hdr))))
+        return XDP_PASS;
+
+    uint8_t protocol = ip6->ip6_nxt;
+
+    struct ip ip = construct_v4_from_v6(ip6);
+
+    uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
+    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip);
+
+    /* TODO: Handle fragmented IPv4 packet */
+
+    /* Strip off the old IPv6 header */
+    if (pop_header(ctx, sizeof(struct ip6_hdr)) < 0) {
+        LOG("failed to pop v6 header");
+        return XDP_PASS;
+    }
+
+    /* Handle any inner protocols that need handling */
+    switch (protocol) {
+        int ret;
+        case IPPROTO_ICMPV6:
+#if 0
+            if ((ret = process_quoted_icmp6(ctx, old_netsum, 0 /* icmp4 doesn't have a pseudo header */)) != XDP_TX)
+                return ret;
+#endif
+            break;
+        case IPPROTO_TCP:
+            if ((ret = process_tcp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+        case IPPROTO_UDP:
+            if ((ret = process_udp(ctx, old_netsum, new_netsum)) != XDP_TX)
+                return ret;
+            break;
+
+        /* These don't need fixups */
+        case IPPROTO_AH:
+        case IPPROTO_ESP:
+        case IPPROTO_SCTP:
+            break;
+    }
+
+    /* Push on the new IPv6 header */
+    if (push_header(ctx, &ip, sizeof(ip)) < 0) {
+        LOG("failed to push v6 header");
+        return XDP_DROP;
+    }
+
+    /* Send the packet out the incoming interface */
+    return XDP_TX;
+}
+
+
 static __always_inline int process_icmp4(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
     struct icmphdr *icmp = NULL;
     if (!(icmp = get_header(ctx, sizeof(struct icmphdr)))) {
@@ -186,78 +324,51 @@ static __always_inline int process_icmp6(struct xdp_md *ctx, uint32_t old_netsum
         return XDP_PASS;
     }
 
-    LOG("Got icmp6 type %d", icmp6->icmp6_type);
+    struct icmphdr icmp4;
+    icmp4.type = icmp6->icmp6_type;
+    icmp4.code = icmp6->icmp6_code;
+    icmp4.checksum = icmp6->icmp6_cksum;
 
     old_netsum += u16_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
-    switch (icmp6->icmp6_type) {
+    if (pop_header(ctx, sizeof(struct icmp6_hdr)) < 0) {
+        LOG("Failed to pop icmp6 header");
+        return XDP_DROP;
+    }
+
+    int ret = XDP_PASS;
+
+    switch (icmp4.type) {
         case ICMP6_ECHO_REPLY:
-            icmp6->icmp6_type = ICMP_ECHO;
+            icmp4.type = ICMP_ECHO;
+            ret = XDP_TX;
             break;
         case ICMP6_DST_UNREACH: /* TODO */
+            break;
         case ICMP6_TIME_EXCEEDED: /* TODO */
-            return XDP_DROP;
+            ret = process_quoted6(ctx);
+            break;
         case ICMP6_ECHO_REQUEST:
             LOG("Got icmp6 echo request");
-            icmp6->icmp6_type = ICMP_ECHO;
+            icmp4.type = ICMP_ECHO;
+            ret = XDP_TX;
             break;
         /* Single hop messages, not routed */
         /* Obsolete messages */
         default: /* Unknown */
-            LOG("Unknown icmp v6 type %d dropped", icmp6->icmp6_type);
-            return XDP_DROP;
+            LOG("Unknown icmp v6 type %d", icmp4.type);
+            break;
     }
 
-    new_netsum += u16_combine(icmp6->icmp6_type, icmp6->icmp6_code);
+    new_netsum += u16_combine(icmp4.type, icmp4.code);
 
-    apply_checksum_fixup(&icmp6->icmp6_cksum, old_netsum, new_netsum);
+    apply_checksum_fixup(&icmp4.checksum, old_netsum, new_netsum);
 
-    return XDP_TX;
-}
-
-
-static __always_inline int process_tcp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
-    struct tcphdr *tcp = NULL;
-    if (!(tcp = get_header(ctx, sizeof(struct tcphdr)))) {
-        return XDP_PASS;
+    if (push_header(ctx, &icmp4, sizeof(icmp4)) < 0) {
+        LOG("Failed to push icmp4 header");
+        return XDP_DROP;
     }
 
-    apply_checksum_fixup(&tcp->check, old_netsum, new_netsum);
-
-    return XDP_TX;
-}
-
-
-static __always_inline int process_udp(struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
-    struct udphdr *udp = NULL;
-    if (!(udp = get_header(ctx, sizeof(struct udphdr)))) {
-        return XDP_PASS;
-    }
-
-    apply_checksum_fixup(&udp->check, old_netsum, new_netsum);
-
-    return XDP_TX;
-}
-
-static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
-    if (memcmp(addr.s6_addr, v6_prefix, sizeof(v6_prefix)) == 0) {
-        /* This is an IPv4 embedded in a v6 address, unpack it. */
-        return (struct in_addr) {
-            .s_addr = addr.s6_addr32[3],
-        };
-    }
-
-    /* Lets use a dummy address for now*/
-    return (struct in_addr) {
-        .s_addr = *(uint32_t*)&ipv4_addr[0],
-    };
-}
-
-
-static __always_inline struct in6_addr remap_v4_to_v6(struct in_addr addr) {
-    struct in6_addr ret;
-    memcpy(ret.s6_addr, v6_prefix, sizeof(v6_prefix));
-    ret.s6_addr32[3] = addr.s_addr;
     return ret;
 }
 
@@ -270,15 +381,7 @@ static __always_inline int process_ipv4(struct xdp_md *ctx) {
 
     uint8_t protocol = iphdr->ip_p;
 
-    /* Construct a new IPv6 header based on the existing ipv4 header */
-    struct ip6_hdr ip6hdr;
-    ip6hdr.ip6_flow = 0x0; /* TODO: Copy traffic control bits */
-    ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
-    ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
-    ip6hdr.ip6_hlim = iphdr->ip_ttl;
-    ip6hdr.ip6_nxt = (protocol == IPPROTO_ICMP) ? IPPROTO_ICMPV6 : protocol;
-    ip6hdr.ip6_src = remap_v4_to_v6(iphdr->ip_src);
-    ip6hdr.ip6_dst = remap_v4_to_v6(iphdr->ip_dst);
+    struct ip6_hdr ip6hdr = construct_v6_from_v4(iphdr);
 
     /* TODO: Handle fragmented IPv4 packet */
 
@@ -331,29 +434,16 @@ static __always_inline int process_ipv6(struct xdp_md *ctx) {
     if (!(ip6 = get_header(ctx, sizeof(struct ip6_hdr))))
         return XDP_PASS;
 
-    /* Construct a new IPv4 header based on the existing IPv6 header */
     uint8_t protocol = ip6->ip6_nxt;
-    struct ip ip;
 
-    ip.ip_v = 0x4;
-    ip.ip_hl = 20/4;
-    ip.ip_tos = 0x00; /* TODO: Copy traffic control bits */
-    ip.ip_len = htons(ntohs(ip6->ip6_plen) + ip.ip_hl * 4);
-    ip.ip_id = 0x00; /* TODO: Handle fragmentation */
-    ip.ip_off = 0x00; // TODO: Handle fragmentation
-    ip.ip_ttl = ip6->ip6_hlim;
-    ip.ip_p = (protocol == IPPROTO_ICMPV6) ? IPPROTO_ICMP : protocol;
-    ip.ip_sum = 0x0000;
-    ip.ip_src = remap_v6_to_v4(ip6->ip6_src);
-    ip.ip_dst = remap_v6_to_v4(ip6->ip6_dst);
-    ip.ip_sum = finalise_netsum(partial_netsum((void*)&ip, sizeof(ip)));
+    struct ip ip = construct_v4_from_v6(ip6);
 
     uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
     uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip);
 
     /* TODO: Handle fragmented IPv4 packet */
 
-    /* Strip off the old IPv4 header */
+    /* Strip off the old IPv6 header */
     if (pop_header(ctx, sizeof(struct ip6_hdr)) < 0) {
         LOG("failed to pop v6 header");
         return XDP_PASS;
