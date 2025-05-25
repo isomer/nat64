@@ -98,10 +98,9 @@ static __always_inline uint16_t finalise_netsum(uint32_t netsum) {
 }
 
 
-static __always_inline status_t err_to_status(int err, status_t category) {
+static __always_inline status_t err_to_status(int err) {
     if (err < 0) {
-        LOG("Mapping error %d", err);
-        return category;
+        return STATUS_INVALID;
     }
     return STATUS_SUCCESS;
 }
@@ -133,12 +132,12 @@ static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t 
         }
     }
 
-    return err_to_status(bpf_xdp_adjust_head(ctx, hdr_size), STATUS_INVALID);
+    return err_to_status(bpf_xdp_adjust_head(ctx, hdr_size));
 }
 
 
 static __always_inline status_t push_header(__arg_ctx struct xdp_md *ctx, __arg_nonnull void *hdr, size_t hdr_size, __arg_nullable uint32_t *new_parent_netsum) {
-    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -hdr_size), STATUS_INVALID));
+    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -hdr_size)));
 
     if (UNLIKELY(ctx->data + hdr_size > ctx->data_end))
         return STATUS_INVALID;
@@ -166,7 +165,7 @@ static __always_inline status_t replace_header(__arg_ctx struct xdp_md *ctx,
         *old_parent_netsum += partial_netsum(old_hdr, old_hdr_size);
     }
 
-    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -delta), STATUS_INVALID));
+    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -delta)));
 
     void *data;
     RETURN_IF_NULL((data = get_header_at(ctx, 0, new_hdr_size)));
