@@ -59,12 +59,13 @@ static const uint8_t ipv4_addr[4] = { 192, 168, 4, 4 };
 #define LOG_IF(cond, msg, ...) do { if (UNLIKELY(cond)) LOG(msg, ##__VA_ARGS__); } while(0)
 
 typedef enum status_t {
-    STATUS_SUCCESS,
-    STATUS_INVALID,
-    STATUS_IGNORE
+    STATUS_SUCCESS, /* Successfully transformed */
+    STATUS_INVALID, /* Invalid input frame - drop with diagnostic */
+    STATUS_PASS, /* Ignore frame */
+    STATUS_DROP, /* Silently drop frame */
 } status_t;
 
-#define RETURN_IF_ERR(x) do { status_t err; if (UNLIKELY((err=(x))) != STATUS_SUCCESS) return err; } while(0)
+#define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
 
@@ -98,8 +99,10 @@ static __always_inline uint16_t finalise_netsum(uint32_t netsum) {
 
 
 static __always_inline status_t err_to_status(int err, status_t category) {
-    if (err < 0)
+    if (err < 0) {
+        LOG("Mapping error %d", err);
         return category;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -123,9 +126,7 @@ static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t 
 
 
 static __always_inline status_t push_header(__arg_ctx struct xdp_md *ctx, __arg_nonnull void *hdr, size_t hdr_size, __arg_nullable uint32_t *new_parent_netsum) {
-    int ret = bpf_xdp_adjust_head(ctx, -hdr_size);
-    if (UNLIKELY(ret < 0))
-        return STATUS_INVALID;
+    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -hdr_size), STATUS_INVALID));
 
     if (UNLIKELY(ctx->data + hdr_size > ctx->data_end))
         return STATUS_INVALID;
@@ -311,23 +312,24 @@ static __always_inline status_t process_tcp(__arg_ctx struct xdp_md *ctx,
 static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ctx,
         uint32_t old_netsum,
         uint32_t new_netsum,
-        __arg_nullable uint32_t *restrict old_parent_netsum,
-        __arg_nullable uint32_t *restrict new_parent_netsum) {
+        __arg_nonnull uint32_t *restrict old_parent_netsum,
+        __arg_nonnull uint32_t *restrict new_parent_netsum) {
+    /* There are no more headers after the ICMP header, and the kernel won't
+     * let us shrink the packet too small, so we can't do the general approach
+     * of popping it and pushing on the replacement, so we want to do it in
+     * place.
+     */
     struct icmphdr *icmp = NULL;
     RETURN_IF_NULL((icmp = get_header(ctx, sizeof(struct icmphdr))));
 
-    struct icmp6_hdr icmp6;
-    memcpy(&icmp6, icmp, sizeof(icmp6));
-
     old_netsum += u8_combine(icmp->type, icmp->code);
+    *old_parent_netsum += u8_combine(icmp->type, icmp->code);
 
-    RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmphdr), old_parent_netsum));
+    status_t ret = STATUS_INVALID;
 
-    status_t ret = STATUS_IGNORE;
-
-    switch (icmp6.icmp6_type) {
+    switch (icmp->type) {
         case ICMP_ECHOREPLY:
-            icmp6.icmp6_type = ICMP6_ECHO_REPLY;
+            icmp->type = ICMP6_ECHO_REPLY;
             ret = STATUS_SUCCESS;
             break;
         /* ICMP Errors should never be quoted, so drop them */
@@ -335,13 +337,13 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
         case ICMP_TIME_EXCEEDED:
             return STATUS_INVALID;
         case ICMP_ECHO:
-            icmp6.icmp6_type = ICMP6_ECHO_REQUEST;
+            icmp->type = ICMP6_ECHO_REQUEST;
             ret = STATUS_SUCCESS;
             break;
         /* Single hop messages, not routed */
-        case 9: /* Router Advertisement - Single hop */
-        case 10: /* Router solicitation - Single hop */
-            return STATUS_IGNORE;
+        case 9: /* Router Advertisement */
+        case 10: /* Router solicitation */
+            return STATUS_DROP;
         /* Obsolete messages */
         case ICMP_TIMESTAMP:
         case ICMP_TIMESTAMPREPLY:
@@ -349,18 +351,17 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
         case ICMP_INFO_REPLY:
         case ICMP_ADDRESS:
         case ICMP_ADDRESSREPLY:
-            LOG("Obsolete icmp v4 type %d dropped", icmp6.icmp6_type);
-            return STATUS_IGNORE;
+            LOG("Obsolete icmp v4 type %d dropped", icmp->type);
+            return STATUS_DROP;
         default: /* Unknown */
-            LOG("Unknown icmp v4 type %d dropped", icmp6.icmp6_type);
+            LOG("Unknown icmp v4 type %d dropped", icmp->type);
             return STATUS_INVALID;
     }
 
-    new_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
+    new_netsum += u8_combine(icmp->type, icmp->code);
+    *new_parent_netsum += u8_combine(icmp->type, icmp->code);
 
-    apply_checksum_fixup(&icmp6.icmp6_cksum, old_netsum, new_netsum, NULL, NULL); // No parent because it's not in the packet right now.
-
-    RETURN_IF_ERR(push_header(ctx, &icmp6, sizeof(icmp6), new_parent_netsum));
+    apply_checksum_fixup(&icmp->checksum, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
     return ret;
 }
@@ -382,7 +383,7 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
 
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmp6_hdr), old_parent_netsum));
 
-    int ret = STATUS_IGNORE;
+    int ret = STATUS_INVALID;
 
     switch (icmp4.type) {
         case ICMP6_ECHO_REPLY:
@@ -437,6 +438,8 @@ static __always_inline status_t process_quoted_ipv4(__arg_ctx struct xdp_md *ctx
         LOG("not ipv4: %d", iphdr->ip_v);
         return STATUS_INVALID;
     }
+
+    LOG("remaining packet len: %d (%d)", packet_len(ctx), sizeof(struct ip));
 
     /* Strip off the old IPv4 header */
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct ip), old_parent_netsum));
@@ -539,16 +542,37 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
     /* Also remove the old type and code, because it's going to be remapped */
     old_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
-    status_t ret = STATUS_IGNORE;
+    status_t ret = STATUS_INVALID;
 
     switch (icmp6.icmp6_type) {
         case ICMP_ECHOREPLY:
             icmp6.icmp6_type = ICMP6_ECHO_REPLY;
             ret = STATUS_SUCCESS;
             break;
-        case ICMP_DEST_UNREACH: /* TODO */
+        case ICMP_DEST_UNREACH:
+            icmp6.icmp6_type = ICMP6_DST_UNREACH;
+            switch (icmp6.icmp6_code) {
+                case ICMP_NET_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_PROT_UNREACH: LOG("Not Implemented"); /* TODO */ break;
+                case ICMP_PORT_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOPORT; break;
+                case ICMP_FRAG_NEEDED: LOG("Not implemented"); /* TODO */ break;
+                case ICMP_SR_FAILED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_NET_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_ISOLATED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_NET_ANO: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_HOST_ANO: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_NET_UNR_TOS: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNR_TOS: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_PKT_FILTERED: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_PREC_VIOLATION: return STATUS_DROP; break;
+                default:
+                  return STATUS_DROP;
+            }
+            ret = process_quoted_ipv4(ctx, &old_netsum, &new_netsum);
             break;
-        case ICMP_TIME_EXCEEDED: /* TODO */
+        case ICMP_TIME_EXCEEDED:
             icmp6.icmp6_type = ICMP6_TIME_EXCEEDED;
             ret = process_quoted_ipv4(ctx, &old_netsum, &new_netsum);
             break;
@@ -560,7 +584,7 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
         case 9: /* Router Advertisement */
         case 10: /* Router solicitation */
             LOG("unroutable single hop message");
-            return STATUS_IGNORE;
+            return STATUS_DROP;
         /* Obsolete messages */
         case ICMP_TIMESTAMP:
         case ICMP_TIMESTAMPREPLY:
@@ -569,10 +593,10 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
         case ICMP_ADDRESS:
         case ICMP_ADDRESSREPLY:
             LOG("Obsolete icmp v4 type %d dropped", icmp6.icmp6_type);
-            return STATUS_IGNORE;
+            return STATUS_DROP;
         default: /* Unknown */
             LOG("Unknown icmp v4 type %d dropped", icmp6.icmp6_type);
-            return STATUS_IGNORE;
+            return STATUS_DROP;
     }
 
     /* ... Add back the packet length to the checksum */
@@ -604,7 +628,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
 
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmp6_hdr), NULL));
 
-    status_t ret = STATUS_IGNORE;
+    status_t ret = STATUS_DROP;
 
     switch (icmp4.type) {
         case ICMP6_ECHO_REPLY:
@@ -620,7 +644,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
                 case ICMP6_DST_UNREACH_ADDR: icmp4.code = ICMP_HOST_UNKNOWN; break;
                 case ICMP6_DST_UNREACH_NOPORT: icmp4.code = ICMP_PORT_UNREACH; break;
                 default:
-                  return STATUS_IGNORE;
+                  return STATUS_DROP;
             }
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
             break;
@@ -765,7 +789,6 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
         RETURN_IF_ERR(pop_header(ctx, sizeof(newhdr), NULL));
 
         status_t ret;
-        LOG("begin packet");
 
         switch (ntohs(newhdr.ether_type)) {
             case ETHERTYPE_IP:
@@ -780,7 +803,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
 
             default:
                 LOG("Unknown ethertype %04x", ntohs(newhdr.ether_type));
-                return STATUS_IGNORE;
+                return STATUS_DROP;
         }
 
         /* Now push our new ethernet header back on the front */
@@ -790,7 +813,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
     } else {
         //LOG("Packet not to magic ethernet address, ignoring.");
         //TODO: We should increment a counter here
-        return STATUS_IGNORE;
+        return STATUS_PASS;
     }
 }
 
@@ -799,9 +822,10 @@ extern int xdp_nat64(__arg_ctx struct xdp_md *ctx);
 SEC("xdp")
 int xdp_nat64(__arg_ctx struct xdp_md *ctx) {
     switch (process_ethernet(ctx)) {
-        case STATUS_IGNORE: return XDP_PASS;
+        case STATUS_PASS: return XDP_PASS;
         case STATUS_INVALID: return XDP_DROP;
         case STATUS_SUCCESS: return XDP_TX;
+        case STATUS_DROP: return XDP_DROP;
     }
 }
 
