@@ -1,14 +1,15 @@
 CLANG?=clang
 LLC?=llc
+CFLAGS?=-O2 -g -D __BPF_TRACING__
 
 all: nat64.o
 
 %.o: %.c
 	$(CLANG) -S \
 		-target bpf \
-		-D __BPF_TRACING__ \
+		$(CFLAGS) \
 		-Wall -Wextra -Wstrict-prototypes -Wmissing-prototypes \
-		-O2 -emit-llvm -c -g -o ${@:.o=.ll} $<
+		-emit-llvm -c -o ${@:.o=.ll} $<
 	$(LLC) -march bpf -filetype obj -o $@ ${@:.o=.ll}
 
 clean:
