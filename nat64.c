@@ -58,6 +58,8 @@ static const uint8_t ipv4_addr[4] = { 192, 168, 4, 4 };
 #define LOG(msg, ...) { static const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
 #define LOG_IF(cond, msg, ...) do { if (UNLIKELY(cond)) LOG(msg, ##__VA_ARGS__); } while(0)
 
+#define MAX(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a > maxtmp_b ? maxtmp_a : maxtmp_b; })
+
 typedef enum status_t {
     STATUS_SUCCESS, /* Successfully transformed */
     STATUS_INVALID, /* Invalid input frame - drop with diagnostic */
@@ -580,7 +582,11 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
                 case ICMP_HOST_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
                 case ICMP_PROT_UNREACH: LOG("Not Implemented"); /* TODO */ break;
                 case ICMP_PORT_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOPORT; break;
-                case ICMP_FRAG_NEEDED: LOG("Not implemented"); /* TODO */ break;
+                case ICMP_FRAG_NEEDED:
+                          icmp6.icmp6_code = ICMP6_PACKET_TOO_BIG;
+                          icmp6.icmp6_type = 0;
+                          icmp6.icmp6_mtu = htonl(MAX(size, icmp6.icmp6_mtu != 0 ? icmp6.icmp6_mtu - sizeof(struct ip) : 1280));
+                          break;
                 case ICMP_SR_FAILED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
                 case ICMP_NET_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
                 case ICMP_HOST_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
@@ -655,10 +661,6 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
     status_t ret = STATUS_DROP;
 
     switch (icmp4.type) {
-        case ICMP6_ECHO_REPLY:
-            icmp4.type = ICMP_ECHO;
-            ret = STATUS_SUCCESS;
-            break;
         case ICMP6_DST_UNREACH:
             icmp4.type = ICMP_DEST_UNREACH;
             switch (icmp4.code) {
@@ -672,9 +674,20 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
             }
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
             break;
-        case ICMP6_TIME_EXCEEDED:
-            icmp4.type = ICMP6_TIME_EXCEEDED;
+        case ICMP6_PACKET_TOO_BIG:
+            icmp4.type = ICMP_DEST_UNREACH;
+            icmp4.code = ICMP_FRAG_NEEDED;
+            icmp4.un.frag.mtu -= 20;
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
+            break;
+        case ICMP6_TIME_EXCEEDED:
+            icmp4.type = ICMP_TIME_EXCEEDED;
+            ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
+            break;
+        case ICMP6_PARAM_PROB: /* TODO */ break;
+        case ICMP6_ECHO_REPLY:
+            icmp4.type = ICMP_ECHO;
+            ret = STATUS_SUCCESS;
             break;
         case ICMP6_ECHO_REQUEST:
             LOG("Got icmp6 echo request");
