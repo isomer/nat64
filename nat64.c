@@ -64,11 +64,17 @@ typedef enum status_t {
     STATUS_IGNORE
 } status_t;
 
-#define RETURN_IF_ERR(x) do { status_t err; if ((err=(x)) != STATUS_SUCCESS) return err; } while(0)
+#define RETURN_IF_ERR(x) do { status_t err; if (UNLIKELY((err=(x))) != STATUS_SUCCESS) return err; } while(0)
+#define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
 
-static __always_inline uint16_t u16_combine(uint8_t hi, uint8_t lo) {
+static __always_inline uint16_t u8_combine(uint8_t hi, uint8_t lo) {
     return ((uint16_t)hi << 8) | lo;
+}
+
+
+static __always_inline uint16_t u32_combine(uint32_t value) {
+    return ((value >> 16) & 0xFFFF) | (value & 0xFFFF);
 }
 
 
@@ -77,7 +83,7 @@ static __always_inline uint32_t partial_netsum(__arg_nonnull void *data, size_t 
     uint8_t *data8 = data;
 
     for(size_t i = 0; i < len; i += 2) {
-        netsum += u16_combine(data8[i], data8[i+1]);
+        netsum += u8_combine(data8[i], data8[i+1]);
     }
 
     return netsum;
@@ -95,6 +101,11 @@ static __always_inline status_t err_to_status(int err, status_t category) {
     if (err < 0)
         return category;
     return STATUS_SUCCESS;
+}
+
+
+static __always_inline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
+    return ctx->data_end - ctx->data;
 }
 
 
@@ -141,9 +152,8 @@ static __always_inline uint32_t pseudo_netsum_from_ipv4(__arg_nonnull const stru
     netsum += ntohs(ip->ip_dst.s_addr >> 16);
     netsum += ntohs(ip->ip_dst.s_addr & 0xFFFF);
 
-    netsum += u16_combine(0, ip->ip_p);
+    netsum += u8_combine(0, ip->ip_p);
     netsum += ntohs(ip->ip_len) - ip->ip_hl * 4; // ip payload length
-
     return netsum;
 }
 
@@ -159,8 +169,8 @@ static __always_inline uint32_t pseudo_netsum_from_ipv6(__arg_nonnull const stru
     netsum += ntohs(ip6->ip6_plen) >> 16; // This will always be zero, because v4 doesn't support jumbo frames
     netsum += ntohs(ip6->ip6_plen) & 0xFFFF;
 
-    netsum += u16_combine(0, 0); // zeros
-    netsum += u16_combine(0, ip6->ip6_nxt);
+    netsum += u8_combine(0, 0); // zeros
+    netsum += u8_combine(0, ip6->ip6_nxt);
 
     netsum = (netsum >> 16) + (netsum & 0xFFFF);
 
@@ -233,8 +243,6 @@ static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
 
 static __always_inline struct ip construct_v4_from_v6(__arg_nonnull const struct ip6_hdr *ip6) {
     struct ip ip;
-    //LOG("ip6->ip6_vfc: %d", ip6->ip6_vfc);
-
     ip.ip_v = 0x4;
     ip.ip_hl = 20/4;
     ip.ip_tos = 0x00; /* TODO: Copy traffic control bits */
@@ -254,8 +262,6 @@ static __always_inline struct ip construct_v4_from_v6(__arg_nonnull const struct
 
 static __always_inline struct ip6_hdr construct_v6_from_v4(struct ip *iphdr) {
     struct ip6_hdr ip6hdr;
-    LOG("iplen: %d hl: %d", ntohs(iphdr->ip_len), iphdr->ip_hl);
-    LOG("plen: %d", ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
     ip6hdr.ip6_flow = 0x0; /* TODO: Copy traffic control bits */
     ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
     ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
@@ -275,10 +281,9 @@ static __always_inline status_t process_udp(__arg_ctx struct xdp_md *ctx,
         uint32_t new_netsum,
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
+
     struct udphdr *udp = NULL;
-    if (UNLIKELY(!(udp = get_header(ctx, sizeof(struct udphdr))))) {
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((udp = get_header(ctx, sizeof(struct udphdr))));
 
     apply_checksum_fixup(&udp->check, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
@@ -294,9 +299,7 @@ static __always_inline status_t process_tcp(__arg_ctx struct xdp_md *ctx,
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct tcphdr *tcp = NULL;
-    if (UNLIKELY(!(tcp = get_header(ctx, sizeof(struct tcphdr))))) {
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((tcp = get_header(ctx, sizeof(struct tcphdr))));
 
     apply_checksum_fixup(&tcp->check, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
@@ -311,15 +314,12 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct icmphdr *icmp = NULL;
-    if (UNLIKELY(!(icmp = get_header(ctx, sizeof(struct icmphdr))))) {
-        LOG("unable to get icmp header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((icmp = get_header(ctx, sizeof(struct icmphdr))));
 
     struct icmp6_hdr icmp6;
     memcpy(&icmp6, icmp, sizeof(icmp6));
 
-    old_netsum += u16_combine(icmp->type, icmp->code);
+    old_netsum += u8_combine(icmp->type, icmp->code);
 
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmphdr), old_parent_netsum));
 
@@ -356,7 +356,7 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
             return STATUS_INVALID;
     }
 
-    new_netsum += u16_combine(icmp6.icmp6_type, icmp6.icmp6_code);
+    new_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
     apply_checksum_fixup(&icmp6.icmp6_cksum, old_netsum, new_netsum, NULL, NULL); // No parent because it's not in the packet right now.
 
@@ -373,20 +373,14 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct icmp6_hdr *icmp6 = NULL;
-    if (UNLIKELY(!(icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))))) {
-        LOG("unable to get icmp header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))));
 
     struct icmphdr icmp4;
     memcpy(&icmp4, icmp6, sizeof(icmp4));
 
-    old_netsum += u16_combine(icmp6->icmp6_type, icmp6->icmp6_code);
+    old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
-    if (UNLIKELY(pop_header(ctx, sizeof(struct icmp6_hdr), old_parent_netsum) < 0)) {
-        LOG("Failed to pop icmp6 header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmp6_hdr), old_parent_netsum));
 
     int ret = STATUS_IGNORE;
 
@@ -413,7 +407,7 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
             break;
     }
 
-    new_netsum += u16_combine(icmp4.type, icmp4.code);
+    new_netsum += u8_combine(icmp4.type, icmp4.code);
 
     apply_checksum_fixup(&icmp4.checksum, old_netsum, new_netsum, NULL, NULL); // No parent because it's not in the packet right now
 
@@ -428,10 +422,7 @@ static __always_inline status_t process_quoted_ipv4(__arg_ctx struct xdp_md *ctx
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct ip *iphdr = NULL;
 
-    if (UNLIKELY(!(iphdr = get_header(ctx, sizeof(struct ip))))) {
-        LOG("Failed to get quoted ipv4 header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((iphdr = get_header(ctx, sizeof(struct ip))));
 
     uint8_t protocol = iphdr->ip_p;
 
@@ -483,8 +474,7 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct ip6_hdr *ip6 = NULL;
 
-    if (!(ip6 = get_header(ctx, sizeof(struct ip6_hdr))))
-        return STATUS_INVALID;
+    RETURN_IF_NULL((ip6 = get_header(ctx, sizeof(struct ip6_hdr))));
 
     if (UNLIKELY((ip6->ip6_vfc & 0xF0) != 0x60)) {
         LOG("ip6 version: %d", ip6->ip6_vfc);
@@ -501,10 +491,7 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
     /* TODO: Handle fragmented IPv4 packet */
 
     /* Strip off the old IPv6 header */
-    if (pop_header(ctx, sizeof(struct ip6_hdr), old_parent_netsum) < 0) {
-        LOG("failed to pop v6 header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_ERR(pop_header(ctx, sizeof(struct ip6_hdr), old_parent_netsum));
 
     /* Handle any inner protocols that need handling */
     switch (protocol) {
@@ -536,17 +523,21 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
 // Ethernet | IPv4 | ICMPv4... => Ethernet | IPv6 | ICMPv6...
 static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
     struct icmphdr *icmp = NULL;
-    if (!(icmp = get_header(ctx, sizeof(struct icmphdr)))) {
-        LOG("unable to get icmp header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((icmp = get_header(ctx, sizeof(struct icmphdr))));
 
     struct icmp6_hdr icmp6;
     memcpy(&icmp6, icmp, sizeof(icmp6));
 
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmphdr), NULL));
 
-    old_netsum += u16_combine(icmp6.icmp6_type, icmp6.icmp6_code);
+    /* The packet length can change when we replace the IP header,
+     * so remove the old packet length from the checksum here.
+     */
+    uint16_t old_packet_len = packet_len(ctx) + sizeof(struct icmphdr);
+    old_netsum += old_packet_len;
+
+    /* Also remove the old type and code, because it's going to be remapped */
+    old_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
     status_t ret = STATUS_IGNORE;
 
@@ -566,8 +557,8 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
             ret = STATUS_SUCCESS;
             break;
         /* Single hop messages, not routed */
-        case 9: /* Router Advertisement - Single hop */
-        case 10: /* Router solicitation - Single hop */
+        case 9: /* Router Advertisement */
+        case 10: /* Router solicitation */
             LOG("unroutable single hop message");
             return STATUS_IGNORE;
         /* Obsolete messages */
@@ -584,12 +575,10 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
             return STATUS_IGNORE;
     }
 
-    LOG("v6chk: 0x%04x (old: 0x%04x, new: 0x%04x)",
-            ntohs(icmp6.icmp6_cksum),
-            old_netsum,
-            new_netsum);
-
-    new_netsum += u16_combine(icmp6.icmp6_type, icmp6.icmp6_code);
+    /* ... Add back the packet length to the checksum */
+    uint16_t new_packet_len = packet_len(ctx) + sizeof(icmp6);
+    new_netsum += new_packet_len;
+    new_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
     /* Modifying the checksum between pop and push header is okay here, because
      * there's no parent to be modified twice */
@@ -604,17 +593,14 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
 // Ethernet | IPv6 | ICMPv6... => Ethernet | IPv4 | ICMPv4...
 static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint32_t old_netsum, uint32_t new_netsum) {
     struct icmp6_hdr *icmp6 = NULL;
-    if (!(icmp6 = get_header(ctx, sizeof(struct icmp6_hdr)))) {
-        LOG("unable to get icmp header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL((icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))));
 
     struct icmphdr icmp4;
     icmp4.type = icmp6->icmp6_type;
     icmp4.code = icmp6->icmp6_code;
     icmp4.checksum = icmp6->icmp6_cksum;
 
-    old_netsum += u16_combine(icmp6->icmp6_type, icmp6->icmp6_code);
+    old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmp6_hdr), NULL));
 
@@ -654,12 +640,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
             break;
     }
 
-    new_netsum += u16_combine(icmp4.type, icmp4.code);
-
-    LOG("icmp4 checksum 0x%04x (old 0x%04x new 0x%04x",
-            ntohs(icmp4.checksum),
-            old_netsum,
-            new_netsum);
+    new_netsum += u8_combine(icmp4.type, icmp4.code);
 
     apply_checksum_fixup(&icmp4.checksum, old_netsum, new_netsum, NULL, NULL);
 
@@ -673,8 +654,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
 static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
     struct ip *iphdr = NULL;
 
-    if (!(iphdr = get_header(ctx, sizeof(struct ip))))
-        return STATUS_INVALID;
+    RETURN_IF_NULL((iphdr = get_header(ctx, sizeof(struct ip))));
 
     uint8_t protocol = iphdr->ip_p;
 
@@ -707,6 +687,8 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
             break;
     }
 
+    ip6hdr.ip6_plen = htons(packet_len(ctx));
+
     /* Push on the new IPv6 header */
     RETURN_IF_ERR(push_header(ctx, &ip6hdr, sizeof(ip6hdr), NULL));
 
@@ -719,8 +701,7 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
 static __always_inline status_t process_ipv6(__arg_ctx struct xdp_md *ctx) {
     struct ip6_hdr *ip6 = NULL;
 
-    if (!(ip6 = get_header(ctx, sizeof(struct ip6_hdr))))
-        return STATUS_INVALID;
+    RETURN_IF_NULL((ip6 = get_header(ctx, sizeof(struct ip6_hdr))));
 
     uint8_t protocol = ip6->ip6_nxt;
 
@@ -753,6 +734,11 @@ static __always_inline status_t process_ipv6(__arg_ctx struct xdp_md *ctx) {
             break;
     }
 
+    uint16_t old = ntohs(ip.ip_len);
+    /* Fixup packet length */
+    ip.ip_len = htons(packet_len(ctx) + sizeof(ip));
+    apply_checksum_fixup(&ip.ip_sum, old, ntohs(ip.ip_len), NULL, NULL);
+
     /* Push on the new IPv6 header */
     RETURN_IF_ERR(push_header(ctx, &ip, sizeof(ip), NULL));
 
@@ -765,10 +751,7 @@ static __always_inline status_t process_ipv6(__arg_ctx struct xdp_md *ctx) {
 static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
     struct ether_header *ethhdr = NULL;
 
-    if (!(ethhdr = get_header(ctx, sizeof(struct ether_header)))) {
-        LOG("packet missing ethernet header");
-        return STATUS_INVALID;
-    }
+    RETURN_IF_NULL(ethhdr = get_header(ctx, sizeof(struct ether_header)));
 
     /* Is this to the magic ethernet address? */
     if (memcmp(magic_ether, ethhdr->ether_dhost, sizeof(magic_ether)) == 0) {
@@ -782,6 +765,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
         RETURN_IF_ERR(pop_header(ctx, sizeof(newhdr), NULL));
 
         status_t ret;
+        LOG("begin packet");
 
         switch (ntohs(newhdr.ether_type)) {
             case ETHERTYPE_IP:
