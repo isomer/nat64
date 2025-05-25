@@ -376,43 +376,36 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
     struct icmp6_hdr *icmp6 = NULL;
     RETURN_IF_NULL((icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))));
 
-    struct icmphdr icmp4;
-    memcpy(&icmp4, icmp6, sizeof(icmp4));
-
     old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
-
-    RETURN_IF_ERR(pop_header(ctx, sizeof(struct icmp6_hdr), old_parent_netsum));
 
     int ret = STATUS_INVALID;
 
-    switch (icmp4.type) {
+    switch (icmp6->icmp6_type) {
         case ICMP6_ECHO_REPLY:
-            icmp4.type = ICMP_ECHO;
+            icmp6->icmp6_type = ICMP_ECHO;
             ret = STATUS_SUCCESS;
             break;
         /* ICMP Errors should not contain an ICMP Error, drop */
         case ICMP6_DST_UNREACH:
         case ICMP6_TIME_EXCEEDED:
-            LOG("nested error %d", icmp4.type);
+            LOG("nested error %d", icmp6->icmp6_type);
             ret = STATUS_INVALID;
             break;
         case ICMP6_ECHO_REQUEST:
             LOG("Got nested icmp6 echo request");
-            icmp4.type = ICMP_ECHO;
+            icmp6->icmp6_type = ICMP_ECHO;
             ret = STATUS_SUCCESS;
             break;
         /* Single hop messages, not routed */
         /* Obsolete messages */
         default: /* Unknown */
-            LOG("Unknown icmp v6 type %d", icmp4.type);
+            LOG("Unknown icmp v6 type %d", icmp6->icmp6_type);
             break;
     }
 
-    new_netsum += u8_combine(icmp4.type, icmp4.code);
+    new_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
-    apply_checksum_fixup(&icmp4.checksum, old_netsum, new_netsum, NULL, NULL); // No parent because it's not in the packet right now
-
-    RETURN_IF_ERR(push_header(ctx, &icmp4, sizeof(icmp4), new_parent_netsum));
+    apply_checksum_fixup(&icmp6->icmp6_cksum, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
     return ret;
 }
