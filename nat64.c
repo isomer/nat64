@@ -280,7 +280,7 @@ static __always_inline struct ip construct_v4_from_v6(__arg_nonnull const struct
     struct ip ip;
     ip.ip_v = 0x4;
     ip.ip_hl = 20/4;
-    ip.ip_tos = 0x00; /* TODO: Copy traffic control bits */
+    ip.ip_tos = (ntohl(ip6->ip6_flow) >> 20) & 0xFF;
     ip.ip_len = htons(ntohs(ip6->ip6_plen) + ip.ip_hl * 4);
     ip.ip_id = 0x00; /* TODO: Handle fragmentation */
     ip.ip_off = 0x00; // TODO: Handle fragmentation
@@ -297,8 +297,7 @@ static __always_inline struct ip construct_v4_from_v6(__arg_nonnull const struct
 
 static __always_inline struct ip6_hdr construct_v6_from_v4(struct ip *iphdr) {
     struct ip6_hdr ip6hdr;
-    ip6hdr.ip6_flow = 0x0; /* TODO: Copy traffic control bits */
-    ip6hdr.ip6_vfc = 0x60; /* TODO: Copy traffic control bits */
+    ip6hdr.ip6_flow = htonl(6 << 28 | iphdr->ip_tos << 20);
     ip6hdr.ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
     ip6hdr.ip6_hlim = iphdr->ip_ttl;
     ip6hdr.ip6_nxt = (iphdr->ip_p == IPPROTO_ICMP) ? IPPROTO_ICMPV6 : iphdr->ip_p;
