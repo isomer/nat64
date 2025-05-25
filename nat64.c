@@ -112,6 +112,18 @@ static __always_inline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
 }
 
 
+static __always_inline void *get_header_at(__arg_ctx struct xdp_md *ctx, size_t offset, size_t hdr_size) {
+    if (UNLIKELY(ctx->data + offset + hdr_size > ctx->data_end))
+        return NULL;
+    return (void *)(unsigned long)(ctx->data + offset);
+}
+
+
+static __always_inline void *get_header(__arg_ctx struct xdp_md *ctx, size_t hdr_size) {
+    return get_header_at(ctx, 0, hdr_size);
+}
+
+
 static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t hdr_size, __arg_nullable uint32_t *old_parent_netsum) {
     if (old_parent_netsum) {
         if (LIKELY(ctx->data + hdr_size <= ctx->data_end)) {
@@ -131,18 +143,40 @@ static __always_inline status_t push_header(__arg_ctx struct xdp_md *ctx, __arg_
     if (UNLIKELY(ctx->data + hdr_size > ctx->data_end))
         return STATUS_INVALID;
 
+    memcpy((void *)(unsigned long)ctx->data, hdr, hdr_size);
+
     if (new_parent_netsum)
         *new_parent_netsum += partial_netsum(hdr, hdr_size);
 
-    memcpy((void *)(unsigned long)ctx->data, hdr, hdr_size);
     return STATUS_SUCCESS;
 }
 
 
-static __always_inline void *get_header(__arg_ctx struct xdp_md *ctx, size_t hdr_size) {
-    if (UNLIKELY(ctx->data + hdr_size > ctx->data_end))
-        return NULL;
-    return (void *)(unsigned long)ctx->data;
+static __always_inline status_t replace_header(__arg_ctx struct xdp_md *ctx,
+        size_t old_hdr_size,
+        __arg_nullable uint32_t *old_parent_netsum,
+        __arg_nonnull void *new_hdr,
+        size_t new_hdr_size,
+        __arg_nullable uint32_t *new_parent_netsum) {
+    ssize_t delta = new_hdr_size - old_hdr_size;
+
+    if (old_parent_netsum) {
+        void *old_hdr;
+        RETURN_IF_NULL((old_hdr = get_header_at(ctx, 0, old_hdr_size)));
+        *old_parent_netsum += partial_netsum(old_hdr, old_hdr_size);
+    }
+
+    RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -delta), STATUS_INVALID));
+
+    void *data;
+    RETURN_IF_NULL((data = get_header_at(ctx, 0, new_hdr_size)));
+
+    memcpy(data, new_hdr, new_hdr_size);
+
+    if (new_parent_netsum)
+        *new_parent_netsum += partial_netsum(data, new_hdr_size);
+
+    return STATUS_SUCCESS;
 }
 
 
@@ -278,13 +312,14 @@ static __always_inline struct ip6_hdr construct_v6_from_v4(struct ip *iphdr) {
 // Ethernet | IPv4 | ICMPv4 | IPv4 | UDP
 // Ethernet | IPv6 | ICMPv6 | IPv6 | UDP
 static __always_inline status_t process_udp(__arg_ctx struct xdp_md *ctx,
+        size_t offset,
         uint32_t old_netsum,
         uint32_t new_netsum,
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
 
     struct udphdr *udp = NULL;
-    RETURN_IF_NULL((udp = get_header(ctx, sizeof(struct udphdr))));
+    RETURN_IF_NULL((udp = get_header_at(ctx, offset, sizeof(struct udphdr))));
 
     apply_checksum_fixup(&udp->check, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
@@ -295,12 +330,13 @@ static __always_inline status_t process_udp(__arg_ctx struct xdp_md *ctx,
 // Ethernet | IPv4 | ICMPv4 | IPv4 | TCP  =>  Ethernet | IPv6 | ICMPv6 | IPv6 | TCP
 // Ethernet | IPv6 | ICMPv6 | IPv6 | TCP  =>  Ethernet | IPv4 | ICMPv4 | IPv4 | TCP
 static __always_inline status_t process_tcp(__arg_ctx struct xdp_md *ctx,
+        size_t offset,
         uint32_t old_netsum,
         uint32_t new_netsum,
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct tcphdr *tcp = NULL;
-    RETURN_IF_NULL((tcp = get_header(ctx, sizeof(struct tcphdr))));
+    RETURN_IF_NULL((tcp = get_header_at(ctx, offset, sizeof(struct tcphdr))));
 
     apply_checksum_fixup(&tcp->check, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
@@ -310,6 +346,7 @@ static __always_inline status_t process_tcp(__arg_ctx struct xdp_md *ctx,
 
 // Ethernet | IPv4 | ICMPv4 | IPv4 | ICMPv4  =>  Ethernet | IPv6 | ICMPv6 | IPv6 | ICMPv6
 static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ctx,
+        size_t offset,
         uint32_t old_netsum,
         uint32_t new_netsum,
         __arg_nonnull uint32_t *restrict old_parent_netsum,
@@ -320,7 +357,7 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
      * place.
      */
     struct icmphdr *icmp = NULL;
-    RETURN_IF_NULL((icmp = get_header(ctx, sizeof(struct icmphdr))));
+    RETURN_IF_NULL((icmp = get_header_at(ctx, offset, sizeof(struct icmphdr))));
 
     old_netsum += u8_combine(icmp->type, icmp->code);
     *old_parent_netsum += u8_combine(icmp->type, icmp->code);
@@ -369,12 +406,13 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
 
 // Ethernet | IPv6 | ICMPv6 | IPv6 | ICMPv6
 static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ctx,
+        size_t offset,
         uint32_t old_netsum,
         uint32_t new_netsum,
         __arg_nullable uint32_t *restrict old_parent_netsum,
         __arg_nullable uint32_t *restrict new_parent_netsum) {
     struct icmp6_hdr *icmp6 = NULL;
-    RETURN_IF_NULL((icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))));
+    RETURN_IF_NULL((icmp6 = get_header_at(ctx, offset, sizeof(struct icmp6_hdr))));
 
     old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
@@ -432,22 +470,20 @@ static __always_inline status_t process_quoted_ipv4(__arg_ctx struct xdp_md *ctx
         return STATUS_INVALID;
     }
 
-    LOG("remaining packet len: %d (%d)", packet_len(ctx), sizeof(struct ip));
-
-    /* Strip off the old IPv4 header */
-    RETURN_IF_ERR(pop_header(ctx, sizeof(struct ip), old_parent_netsum));
+    /* Due to limits on minimum packet sizes imposed by the kernel, we cannot
+     * do the usual pop / push for this, but instead need to do it all in place.
+     */
+    RETURN_IF_ERR(replace_header(ctx, sizeof(struct ip), old_parent_netsum, &ip6hdr, sizeof(ip6hdr), new_parent_netsum));
+    size_t offset = sizeof(ip6hdr);
 
     /* Handle any inner protocols that need handling */
     switch (protocol) {
         case IPPROTO_ICMP:
-            RETURN_IF_ERR(process_quoted_icmp4(ctx, 0 /* icmp4 has no pseudo header */, new_netsum, old_parent_netsum, new_parent_netsum));
-            break;
+            return process_quoted_icmp4(ctx, offset, 0 /* icmp4 has no pseudo header */, new_netsum, old_parent_netsum, new_parent_netsum);
         case IPPROTO_TCP:
-            RETURN_IF_ERR(process_tcp(ctx, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
-            break;
+            return process_tcp(ctx, offset, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
         case IPPROTO_UDP:
-            RETURN_IF_ERR(process_udp(ctx, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
-            break;
+            return process_udp(ctx, offset, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum);
 
         /* These don't need fixups */
         case IPPROTO_AH:
@@ -455,9 +491,6 @@ static __always_inline status_t process_quoted_ipv4(__arg_ctx struct xdp_md *ctx
         case IPPROTO_SCTP:
             break;
     }
-
-    /* Push on the new IPv6 header (updating the enclosing checksum while we're here */
-    RETURN_IF_ERR(push_header(ctx, &ip6hdr, sizeof(ip6hdr), new_parent_netsum));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -486,19 +519,19 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
 
     /* TODO: Handle fragmented IPv4 packet */
 
-    /* Strip off the old IPv6 header */
-    RETURN_IF_ERR(pop_header(ctx, sizeof(struct ip6_hdr), old_parent_netsum));
+    RETURN_IF_ERR(replace_header(ctx, sizeof(struct ip6_hdr), old_parent_netsum, &ip, sizeof(ip), new_parent_netsum));
+    size_t offset = sizeof(ip);
 
     /* Handle any inner protocols that need handling */
     switch (protocol) {
         case IPPROTO_ICMPV6:
-            RETURN_IF_ERR(process_quoted_icmp6(ctx, old_netsum, 0 /* icmp4 doesn't have a pseudo header */, old_parent_netsum, new_parent_netsum));
+            RETURN_IF_ERR(process_quoted_icmp6(ctx, offset, old_netsum, 0 /* icmp4 doesn't have a pseudo header */, old_parent_netsum, new_parent_netsum));
             break;
         case IPPROTO_TCP:
-            RETURN_IF_ERR(process_tcp(ctx, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
+            RETURN_IF_ERR(process_tcp(ctx, offset, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
             break;
         case IPPROTO_UDP:
-            RETURN_IF_ERR(process_udp(ctx, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
+            RETURN_IF_ERR(process_udp(ctx, offset, old_netsum, new_netsum, old_parent_netsum, new_parent_netsum));
             break;
 
         /* These don't need fixups */
@@ -691,10 +724,10 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
             RETURN_IF_ERR(process_icmp4(ctx, 0 /* icmp4 has no pseudo header */, new_netsum));
             break;
         case IPPROTO_TCP:
-            RETURN_IF_ERR(process_tcp(ctx, old_netsum, new_netsum, NULL, NULL));
+            RETURN_IF_ERR(process_tcp(ctx, 0, old_netsum, new_netsum, NULL, NULL));
             break;
         case IPPROTO_UDP:
-            RETURN_IF_ERR(process_udp(ctx, old_netsum, new_netsum, NULL, NULL));
+            RETURN_IF_ERR(process_udp(ctx, 0, old_netsum, new_netsum, NULL, NULL));
             break;
 
         /* These don't need fixups */
@@ -738,10 +771,10 @@ static __always_inline status_t process_ipv6(__arg_ctx struct xdp_md *ctx) {
             RETURN_IF_ERR(process_icmp6(ctx, old_netsum, 0 /* icmp4 doesn't have a pseudo header */));
             break;
         case IPPROTO_TCP:
-            RETURN_IF_ERR(process_tcp(ctx, old_netsum, new_netsum, NULL, NULL));
+            RETURN_IF_ERR(process_tcp(ctx, 0, old_netsum, new_netsum, NULL, NULL));
             break;
         case IPPROTO_UDP:
-            RETURN_IF_ERR(process_udp(ctx, old_netsum, new_netsum, NULL, NULL));
+            RETURN_IF_ERR(process_udp(ctx, 0, old_netsum, new_netsum, NULL, NULL));
             break;
 
         /* These don't need fixups */
