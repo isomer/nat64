@@ -29,8 +29,10 @@ ip route add 64:ff9b:1::/96 via fe80::64 dev veth0
 ip route add 192.168.4.4 via 10.0.0.2 dev veth0
 ip neigh add proxy 192.168.4.4 dev wireless
 ip addr add 64:ff9b:1::192.168.4.4 dev veth0
-echo 1 | tee /proc/sys/net/ipv4/conf/wireless/proxy_arp
-echo 1 | tee /proc/sys/net/ipv4/conf/veth0/forwarding
-echo 1 | tee /proc/sys/net/ipv4/conf/wireless/forwarding
+
+echo 1 | tee \
+    /proc/sys/net/ipv4/conf/wireless/proxy_arp \
+    /proc/sys/net/ipv4/conf/veth0/forwarding \
+    /proc/sys/net/ipv4/conf/wireless/forwarding
 
 cat /sys/kernel/tracing/trace_pipe
