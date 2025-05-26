@@ -19,7 +19,12 @@
  */
 
 // rfc7915
+#ifndef TEST
 #include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#else
+#include "test_bpf.h"
+#endif
 #include <net/ethernet.h>
 #include <netinet/ip6.h>
 #include <netinet/ip.h>
@@ -29,7 +34,6 @@
 #include <netinet/icmp6.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <bpf/bpf_helpers.h>
 
 static const uint8_t magic_ether[ETH_ALEN] = { 02, 00, 00, 00, 00, 0x64 };
 static const uint8_t v6_prefix[] = { 0x00, 0x64, 0xFF, 0x9B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -65,6 +69,13 @@ typedef enum status_t {
     STATUS_PASS, /* Ignore frame */
     STATUS_DROP, /* Silently drop frame */
 } status_t;
+
+static const char *status_names[] = {
+    [STATUS_SUCCESS] = "SUCCESS",
+    [STATUS_INVALID] = "INVALID",
+    [STATUS_PASS] = "PASS",
+    [STATUS_DROP] = "DROP",
+};
 
 #define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
@@ -113,8 +124,12 @@ static __always_inline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
 
 
 static __always_inline void *get_header_at(__arg_ctx struct xdp_md *ctx, size_t offset, size_t hdr_size) {
-    if (UNLIKELY(ctx->data + offset + hdr_size > ctx->data_end))
+    if (UNLIKELY(ctx->data + offset + hdr_size > ctx->data_end)) {
+        LOG("Wanted header of %d bytes, only %d remaining",
+                hdr_size,
+                (int)(ctx->data_end - ctx->data - offset));
         return NULL;
+    }
     return (void *)(unsigned long)(ctx->data + offset);
 }
 
