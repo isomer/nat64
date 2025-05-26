@@ -29,7 +29,6 @@
 #include <netinet/icmp6.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
 static const uint8_t magic_ether[ETH_ALEN] = { 02, 00, 00, 00, 00, 0x64 };
@@ -585,7 +584,7 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
                 case ICMP_FRAG_NEEDED:
                           icmp6.icmp6_code = ICMP6_PACKET_TOO_BIG;
                           icmp6.icmp6_type = 0;
-                          icmp6.icmp6_mtu = htonl(MAX(size, icmp6.icmp6_mtu != 0 ? icmp6.icmp6_mtu - sizeof(struct ip) : 1280));
+                          icmp6.icmp6_mtu = htonl(icmp6.icmp6_mtu != 0 ? icmp6.icmp6_mtu - sizeof(struct ip) : 1280);
                           break;
                 case ICMP_SR_FAILED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
                 case ICMP_NET_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
