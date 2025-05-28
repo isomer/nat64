@@ -35,4 +35,5 @@ echo 1 | tee \
     /proc/sys/net/ipv4/conf/veth0/forwarding \
     /proc/sys/net/ipv4/conf/wireless/forwarding
 
-cat /sys/kernel/tracing/trace_pipe
+# Tail the trace log, when you press ^C, dump the counters
+cat /sys/kernel/tracing/trace_pipe || bpftool map dump name nat64_counters

@@ -80,6 +80,39 @@ static const char *status_names[] = {
 #define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
+typedef enum {
+    COUNTER_INVALID_IPVER,
+    COUNTER_NEST_ICMP_ERR,
+    COUNTER_OBSOLETE_ICMP,
+    COUNTER_TRUNCATED,
+    COUNTER_UNKNOWN_ETHERTYPE,
+    COUNTER_UNKNOWN_ICMPV4,
+    COUNTER_UNKNOWN_ICMPV6,
+    COUNTER_UNKNOWN_IPV4,
+    COUNTER_UNKNOWN_IPV6,
+    COUNTER_WRONG_MAC,
+    COUNTER_MAX,
+} counter_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, COUNTER_MAX);
+    __type(key, uint32_t);
+    __type(value, uint64_t);
+} nat64_counters SEC(".maps");
+
+static __always_inline void increment_counter_by(counter_t counter, uint64_t value) {
+    uint32_t key = counter;
+    uint64_t *counter_value = bpf_map_lookup_elem(&nat64_counters, &key);
+    if (counter_value) {
+        __sync_fetch_and_add(counter_value, value);
+    }
+}
+
+static __always_inline void increment_counter(counter_t counter) {
+    increment_counter_by(counter, 1);
+}
+
 
 static __always_inline uint16_t u8_combine(uint8_t hi, uint8_t lo) {
     return ((uint16_t)hi << 8) | lo;
@@ -125,6 +158,7 @@ static __always_inline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
 
 static __always_inline void *get_header_at(__arg_ctx struct xdp_md *ctx, size_t offset, size_t hdr_size) {
     if (UNLIKELY(ctx->data + offset + hdr_size > ctx->data_end)) {
+        increment_counter(COUNTER_TRUNCATED);
         LOG("Wanted header of %d bytes, only %d remaining",
                 hdr_size,
                 (int)(ctx->data_end - ctx->data - offset));
@@ -145,6 +179,7 @@ static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t 
             *old_parent_netsum += partial_netsum((void *)(unsigned long)ctx->data, hdr_size);
         } else {
             LOG("pop_header can't netsum");
+            increment_counter(COUNTER_TRUNCATED);
         }
     }
 
@@ -155,8 +190,10 @@ static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t 
 static __always_inline status_t push_header(__arg_ctx struct xdp_md *ctx, __arg_nonnull void *hdr, size_t hdr_size, __arg_nullable uint32_t *new_parent_netsum) {
     RETURN_IF_ERR(err_to_status(bpf_xdp_adjust_head(ctx, -hdr_size)));
 
-    if (UNLIKELY(ctx->data + hdr_size > ctx->data_end))
+    if (UNLIKELY(ctx->data + hdr_size > ctx->data_end)) {
+        increment_counter(COUNTER_TRUNCATED);
         return STATUS_INVALID;
+    }
 
     memcpy((void *)(unsigned long)ctx->data, hdr, hdr_size);
 
@@ -403,9 +440,11 @@ static __always_inline status_t process_quoted_icmp4(__arg_ctx struct xdp_md *ct
         case ICMP_ADDRESS:
         case ICMP_ADDRESSREPLY:
             LOG("Obsolete icmp v4 type %d dropped", icmp->type);
+            increment_counter(COUNTER_OBSOLETE_ICMP);
             return STATUS_DROP;
         default: /* Unknown */
             LOG("Unknown icmp v4 type %d dropped", icmp->type);
+            increment_counter(COUNTER_UNKNOWN_ICMPV4);
             return STATUS_INVALID;
     }
 
@@ -441,10 +480,10 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
         case ICMP6_DST_UNREACH:
         case ICMP6_TIME_EXCEEDED:
             LOG("nested error %d", icmp6->icmp6_type);
+            increment_counter(COUNTER_NEST_ICMP_ERR);
             ret = STATUS_INVALID;
             break;
         case ICMP6_ECHO_REQUEST:
-            LOG("Got nested icmp6 echo request");
             icmp6->icmp6_type = ICMP_ECHO;
             ret = STATUS_SUCCESS;
             break;
@@ -452,6 +491,7 @@ static __always_inline status_t process_quoted_icmp6(__arg_ctx struct xdp_md *ct
         /* Obsolete messages */
         default: /* Unknown */
             LOG("Unknown icmp v6 type %d", icmp6->icmp6_type);
+            increment_counter(COUNTER_UNKNOWN_ICMPV6);
             break;
     }
 
@@ -481,6 +521,7 @@ static __always_inline status_t process_quoted_ipv4(__arg_ctx struct xdp_md *ctx
 
     if (UNLIKELY(iphdr->ip_v != 0x04)) {
         LOG("not ipv4: %d", iphdr->ip_v);
+        increment_counter(COUNTER_INVALID_IPVER);
         return STATUS_INVALID;
     }
 
@@ -521,6 +562,7 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
 
     if (UNLIKELY((ip6->ip6_vfc & 0xF0) != 0x60)) {
         LOG("ip6 version: %d", ip6->ip6_vfc);
+        increment_counter(COUNTER_INVALID_IPVER);
         return STATUS_INVALID;
     }
 
@@ -553,6 +595,9 @@ static __always_inline status_t process_quoted_ipv6(__arg_ctx struct xdp_md *ctx
         case IPPROTO_ESP:
         case IPPROTO_SCTP:
             break;
+
+        default:
+            increment_counter(COUNTER_UNKNOWN_IPV6);
     }
 
     /* Push on the new IPv6 header */
@@ -637,9 +682,11 @@ static __always_inline status_t process_icmp4(__arg_ctx struct xdp_md *ctx, uint
         case ICMP_ADDRESS:
         case ICMP_ADDRESSREPLY:
             LOG("Obsolete icmp v4 type %d dropped", icmp6.icmp6_type);
+            increment_counter(COUNTER_OBSOLETE_ICMP);
             return STATUS_DROP;
         default: /* Unknown */
             LOG("Unknown icmp v4 type %d dropped", icmp6.icmp6_type);
+            increment_counter(COUNTER_UNKNOWN_ICMPV4);
             return STATUS_DROP;
     }
 
@@ -684,6 +731,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
                 case ICMP6_DST_UNREACH_ADDR: icmp4.code = ICMP_HOST_UNKNOWN; break;
                 case ICMP6_DST_UNREACH_NOPORT: icmp4.code = ICMP_PORT_UNREACH; break;
                 default:
+                  LOG("Unknown ICMPv6 Destination Unreachable %d", icmp4.code);
                   return STATUS_DROP;
             }
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
@@ -705,13 +753,13 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
             break;
         case ICMP6_ECHO_REQUEST:
             LOG("Got icmp6 echo request");
-            icmp4.type = ICMP_ECHO;
             ret = STATUS_SUCCESS;
             break;
         /* Single hop messages, not routed */
         /* Obsolete messages */
         default: /* Unknown */
             LOG("Unknown icmp v6 type %d", icmp4.type);
+            increment_counter(COUNTER_UNKNOWN_ICMPV6);
             break;
     }
 
@@ -760,6 +808,10 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
         case IPPROTO_ESP:
         case IPPROTO_SCTP:
             break;
+
+        default:
+            increment_counter(COUNTER_UNKNOWN_IPV4);
+            LOG("Unknown IPv4 protocol %d", protocol);
     }
 
     ip6hdr.ip6_plen = htons(packet_len(ctx));
@@ -807,6 +859,10 @@ static __always_inline status_t process_ipv6(__arg_ctx struct xdp_md *ctx) {
         case IPPROTO_ESP:
         case IPPROTO_SCTP:
             break;
+
+        default:
+            increment_counter(COUNTER_UNKNOWN_IPV6);
+            LOG("Unknown IP Protocol %d", protocol);
     }
 
     uint16_t old = ntohs(ip.ip_len);
@@ -854,6 +910,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
 
             default:
                 LOG("Unknown ethertype %04x", ntohs(newhdr.ether_type));
+                increment_counter(COUNTER_UNKNOWN_ETHERTYPE);
                 return STATUS_DROP;
         }
 
@@ -864,6 +921,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
     } else {
         //LOG("Packet not to magic ethernet address, ignoring.");
         //TODO: We should increment a counter here
+        increment_counter(COUNTER_WRONG_MAC);
         return STATUS_PASS;
     }
 }
