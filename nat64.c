@@ -84,6 +84,7 @@ typedef enum {
     COUNTER_INVALID_IPVER,
     COUNTER_NEST_ICMP_ERR,
     COUNTER_OBSOLETE_ICMP,
+    COUNTER_SUCCESS,
     COUNTER_TRUNCATED,
     COUNTER_UNKNOWN_ETHERTYPE,
     COUNTER_UNKNOWN_ICMPV4,
@@ -933,7 +934,9 @@ int xdp_nat64(__arg_ctx struct xdp_md *ctx) {
     switch (process_ethernet(ctx)) {
         case STATUS_PASS: return XDP_PASS;
         case STATUS_INVALID: return XDP_DROP;
-        case STATUS_SUCCESS: return XDP_TX;
+        case STATUS_SUCCESS:
+                             increment_counter(COUNTER_SUCCESS);
+                             return XDP_TX;
         case STATUS_DROP: return XDP_DROP;
     }
 }
