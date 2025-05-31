@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- *  Test wrappers for bpf functions
+ *  Shared definitions between userspace and ebpf program for nat64
  *  Copyright (C) 2025  Perry Lorier
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -17,40 +17,36 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
-#ifndef TEST_BPF_H
-#define TEST_BPF_H
-#include <sys/types.h>
+#ifndef NAT64_H
+#define NAT64_h
 #include <stdint.h>
+#include <net/ethernet.h>
 
-#define __arg_ctx
-#define __arg_nullable
-#define __arg_nonnull
+typedef enum {
+    COUNTER_INVALID_IPVER,
+    COUNTER_NEST_ICMP_ERR,
+    COUNTER_OBSOLETE_ICMP,
+    COUNTER_SUCCESS,
+    COUNTER_TRUNCATED,
+    COUNTER_UNKNOWN_ETHERTYPE,
+    COUNTER_UNKNOWN_ICMPV4,
+    COUNTER_UNKNOWN_ICMPV6,
+    COUNTER_UNKNOWN_IPV4,
+    COUNTER_UNKNOWN_IPV6,
+    COUNTER_WRONG_MAC,
+    COUNTER_MAX,
+} counter_t;
 
-#define SEC(section)
+enum { VERSION = 1 };
 
-struct xdp_md {
-    uintptr_t data;
-    uintptr_t data_end;
-    uintptr_t data_meta;
-    uint32_t ingress_ifindex;
-    uint32_t rx_queue_index;
-};
-
-long bpf_trace_printk(const char *restrict fmt, size_t fmt_size, ...);
-long bpf_xdp_adjust_head(struct xdp_md *ctx, int delta);
-
-enum {
-    XDP_ABORTED = 0,
-    XDP_DROP,
-    XDP_PASS,
-    XDP_TX,
-    XDP_REDIRECT,
-};
-
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define __array(name, val) typeof(val) *name[]
-#define __ulong(name, val) enum { ___bpf_concat(__unique_value, __COUNTER__) = val } name
-
+typedef struct configmap_t {
+    int version;
+    int success_action;
+    int ignore_action;
+    uint8_t v6_prefix[16];
+    uint8_t magic_mac[ETH_ALEN];
+    uint8_t gateway_mac[ETH_ALEN];
+    uint8_t ipv4_addr[4];
+} configmap_t;
 
 #endif

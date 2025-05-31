@@ -19,7 +19,8 @@
  */
 
 // rfc7915
-#ifndef TEST
+#include "nat64.h"
+#ifdef BPF
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #else
@@ -66,48 +67,41 @@ static const uint8_t ipv4_addr[4] = { 192, 168, 4, 4 };
 typedef enum status_t {
     STATUS_SUCCESS, /* Successfully transformed */
     STATUS_INVALID, /* Invalid input frame - drop with diagnostic */
-    STATUS_PASS, /* Ignore frame */
+    STATUS_IGNORE, /* Ignore frame */
     STATUS_DROP, /* Silently drop frame */
 } status_t;
 
 static const char *status_names[] = {
     [STATUS_SUCCESS] = "SUCCESS",
     [STATUS_INVALID] = "INVALID",
-    [STATUS_PASS] = "PASS",
+    [STATUS_IGNORE] = "IGNORE",
     [STATUS_DROP] = "DROP",
 };
 
 #define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
-typedef enum {
-    COUNTER_INVALID_IPVER,
-    COUNTER_NEST_ICMP_ERR,
-    COUNTER_OBSOLETE_ICMP,
-    COUNTER_SUCCESS,
-    COUNTER_TRUNCATED,
-    COUNTER_UNKNOWN_ETHERTYPE,
-    COUNTER_UNKNOWN_ICMPV4,
-    COUNTER_UNKNOWN_ICMPV6,
-    COUNTER_UNKNOWN_IPV4,
-    COUNTER_UNKNOWN_IPV6,
-    COUNTER_WRONG_MAC,
-    COUNTER_MAX,
-} counter_t;
-
+#ifdef BPF
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, COUNTER_MAX);
     __type(key, uint32_t);
     __type(value, uint64_t);
 } nat64_counters SEC(".maps");
+#else
+uint64_t nat64_counters[COUNTER_MAX];
+#endif
 
 static __always_inline void increment_counter_by(counter_t counter, uint64_t value) {
+#ifdef BPF
     uint32_t key = counter;
     uint64_t *counter_value = bpf_map_lookup_elem(&nat64_counters, &key);
     if (counter_value) {
         __sync_fetch_and_add(counter_value, value);
     }
+#else
+    nat64_counters[counter] += value;
+#endif
 }
 
 static __always_inline void increment_counter(counter_t counter) {
@@ -712,9 +706,7 @@ static __always_inline status_t process_icmp6(__arg_ctx struct xdp_md *ctx, uint
     RETURN_IF_NULL((icmp6 = get_header(ctx, sizeof(struct icmp6_hdr))));
 
     struct icmphdr icmp4;
-    icmp4.type = icmp6->icmp6_type;
-    icmp4.code = icmp6->icmp6_code;
-    icmp4.checksum = icmp6->icmp6_cksum;
+    memcpy(&icmp4, icmp6, sizeof(icmp4));
 
     old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
@@ -923,7 +915,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
         //LOG("Packet not to magic ethernet address, ignoring.");
         //TODO: We should increment a counter here
         increment_counter(COUNTER_WRONG_MAC);
-        return STATUS_PASS;
+        return STATUS_IGNORE;
     }
 }
 
@@ -932,13 +924,15 @@ extern int xdp_nat64(__arg_ctx struct xdp_md *ctx);
 SEC("xdp")
 int xdp_nat64(__arg_ctx struct xdp_md *ctx) {
     switch (process_ethernet(ctx)) {
-        case STATUS_PASS: return XDP_PASS;
+        case STATUS_IGNORE: return XDP_PASS;
         case STATUS_INVALID: return XDP_DROP;
         case STATUS_SUCCESS:
                              increment_counter(COUNTER_SUCCESS);
                              return XDP_TX;
         case STATUS_DROP: return XDP_DROP;
     }
+
+    return XDP_DROP;
 }
 
 char _license[] SEC("license") = "GPL";

@@ -113,7 +113,7 @@ bool perform_test(const struct test_case *test) {
                     data[i+2] == test->output[i+2] && data[i+3] == test->output[i+3] ? " " : "*",
                     test->output[i], test->output[i+1], test->output[i+2], test->output[i+3]);
         }
-        printf("%d\n", test->output_len - i);
+        printf("%zd\n", test->output_len - i);
         return false;
     }
     else
@@ -123,7 +123,7 @@ bool perform_test(const struct test_case *test) {
 int main(int argc, char *argv[]) {
     size_t count = sizeof(test_cases) / sizeof(test_cases[0]);
     for(size_t i = 0; i < count; ++i) {
-        printf("%i: %s - %s\n",
+        printf("%zi: %s - %s\n",
                 i+1,
                 perform_test(&test_cases[i]) ? "pass" : "fail",
                 test_cases[i].description);

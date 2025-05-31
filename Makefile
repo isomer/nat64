@@ -1,28 +1,20 @@
 CLANG?=clang
 LLC?=llc
-CFLAGS?=-O2 -g -D __BPF_TRACING__
+CFLAGS?=-O2 -g -D __BPF_TRACING__ -Wall -Wextra -Wstrict-prototypes -Wmissing-prototypes
 
-ifdef TEST
-TARGET=nat64
-CFLAGS:=$(CFLAGS) -D TEST=1
+
+all: nat64.bpf.o nat64
 
 nat64: nat64.o test_bpf.o test_case.o
 
-else
-TARGET=nat64.o
-endif
-
 all: $(TARGET)
 
-ifndef TEST
-%.o: %.c
+%.bpf.o: %.c BPF=1
 	$(CLANG) -S \
 		-target bpf \
 		$(CFLAGS) \
-		-Wall -Wextra -Wstrict-prototypes -Wmissing-prototypes \
 		-emit-llvm -c -o ${@:.o=.ll} $<
 	$(LLC) -march bpf -filetype obj -o $@ ${@:.o=.ll}
-endif
 
 clean:
 	rm -f *.o *.ll
