@@ -9,10 +9,12 @@ nat64: nat64.o test_bpf.o test_case.o
 
 all: $(TARGET)
 
-%.bpf.o: %.c BPF=1
+%.bpf.o: BPF=1
+%.bpf.o: %.c
 	$(CLANG) -S \
 		-target bpf \
 		$(CFLAGS) \
+		-D BPF=$(BPF) \
 		-emit-llvm -c -o ${@:.o=.ll} $<
 	$(LLC) -march bpf -filetype obj -o $@ ${@:.o=.ll}
 
