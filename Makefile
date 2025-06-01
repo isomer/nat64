@@ -3,9 +3,11 @@ LLC?=llc
 CFLAGS?=-O2 -g -D __BPF_TRACING__ -Wall -Wextra -Wstrict-prototypes -Wmissing-prototypes
 
 
-all: nat64.bpf.o nat64
+all: nat64.bpf.o nat64 nat64cli
 
 nat64: nat64.o test_bpf.o test_case.o
+
+nat64cli: LDLIBS=-lxdp -lbpf
 
 all: $(TARGET)
 
@@ -19,4 +21,4 @@ all: $(TARGET)
 	$(LLC) -march bpf -filetype obj -o $@ ${@:.o=.ll}
 
 clean:
-	rm -f *.o *.ll
+	rm -f *.o *.ll nat64cli
