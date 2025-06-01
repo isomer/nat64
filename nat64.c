@@ -36,10 +36,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-static const uint8_t magic_ether[ETH_ALEN] = { 02, 00, 00, 00, 00, 0x64 };
-static const uint8_t v6_prefix[] = { 0x00, 0x64, 0xFF, 0x9B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-static const uint8_t ipv4_addr[4] = { 192, 168, 4, 4 };
-
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
@@ -59,7 +55,7 @@ static const uint8_t ipv4_addr[4] = { 192, 168, 4, 4 };
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
-#define LOG(msg, ...) { static const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
+#define LOG(msg, ...) { const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
 #define LOG_IF(cond, msg, ...) do { if (UNLIKELY(cond)) LOG(msg, ##__VA_ARGS__); } while(0)
 
 #define MAX(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a > maxtmp_b ? maxtmp_a : maxtmp_b; })
@@ -71,13 +67,6 @@ typedef enum status_t {
     STATUS_DROP, /* Silently drop frame */
 } status_t;
 
-static const char *status_names[] = {
-    [STATUS_SUCCESS] = "SUCCESS",
-    [STATUS_INVALID] = "INVALID",
-    [STATUS_IGNORE] = "IGNORE",
-    [STATUS_DROP] = "DROP",
-};
-
 #define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
@@ -88,9 +77,17 @@ struct {
     __type(key, uint32_t);
     __type(value, uint64_t);
 } nat64_counters SEC(".maps");
+
 #else
 uint64_t nat64_counters[COUNTER_MAX];
 #endif
+
+static volatile const configmap_t nat64_configmap;
+
+static __always_inline const configmap_t *configmap(void) {
+    /* discard the volatile, it's only needed during the compile phase */
+    return (const configmap_t *)&nat64_configmap;
+}
 
 static __always_inline void increment_counter_by(counter_t counter, uint64_t value) {
 #ifdef BPF
@@ -103,6 +100,7 @@ static __always_inline void increment_counter_by(counter_t counter, uint64_t val
     nat64_counters[counter] += value;
 #endif
 }
+
 
 static __always_inline void increment_counter(counter_t counter) {
     increment_counter_by(counter, 1);
@@ -302,14 +300,14 @@ static __always_inline void apply_checksum_fixup(__arg_nonnull uint16_t *checksu
 
 static __always_inline struct in6_addr remap_v4_to_v6(struct in_addr addr) {
     struct in6_addr ret;
-    memcpy(ret.s6_addr, v6_prefix, sizeof(v6_prefix));
+    memcpy(ret.s6_addr, configmap()->v6_prefix, sizeof(configmap()->v6_prefix));
     ret.s6_addr32[3] = addr.s_addr;
     return ret;
 }
 
 
 static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
-    if (memcmp(addr.s6_addr, v6_prefix, sizeof(v6_prefix)) == 0) {
+    if (memcmp(addr.s6_addr, configmap()->v6_prefix, sizeof(configmap()->v6_prefix)) == 0) {
         /* This is an IPv4 embedded in a v6 address, unpack it. */
         return (struct in_addr) {
             .s_addr = addr.s6_addr32[3],
@@ -318,7 +316,7 @@ static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
 
     /* Lets use a dummy address for now*/
     return (struct in_addr) {
-        .s_addr = *(uint32_t*)&ipv4_addr[0],
+        .s_addr = *(uint32_t*)&configmap()->ipv4_addr[0],
     };
 }
 
@@ -878,7 +876,7 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
     RETURN_IF_NULL(ethhdr = get_header(ctx, sizeof(struct ether_header)));
 
     /* Is this to the magic ethernet address? */
-    if (memcmp(magic_ether, ethhdr->ether_dhost, sizeof(magic_ether)) == 0) {
+    if (memcmp(configmap()->magic_mac, ethhdr->ether_dhost, sizeof(configmap()->magic_mac)) == 0) {
         struct ether_header newhdr;
         /* Build a new header */
         memcpy(newhdr.ether_dhost, ethhdr->ether_shost, ETH_ALEN);
@@ -924,11 +922,11 @@ extern int xdp_nat64(__arg_ctx struct xdp_md *ctx);
 SEC("xdp")
 int xdp_nat64(__arg_ctx struct xdp_md *ctx) {
     switch (process_ethernet(ctx)) {
-        case STATUS_IGNORE: return XDP_PASS;
+        case STATUS_IGNORE: return nat64_configmap.ignore_action;
         case STATUS_INVALID: return XDP_DROP;
         case STATUS_SUCCESS:
                              increment_counter(COUNTER_SUCCESS);
-                             return XDP_TX;
+                             return nat64_configmap.success_action;
         case STATUS_DROP: return XDP_DROP;
     }
 

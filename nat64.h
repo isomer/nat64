@@ -18,7 +18,7 @@
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 #ifndef NAT64_H
-#define NAT64_h
+#define NAT64_H
 #include <stdint.h>
 #include <net/ethernet.h>
 
