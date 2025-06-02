@@ -82,7 +82,9 @@ struct {
 uint64_t nat64_counters[COUNTER_MAX];
 #endif
 
-static volatile const configmap_t nat64_configmap;
+static volatile configmap_t nat64_configmap = {
+    .version = VERSION,
+};
 
 static __always_inline const configmap_t *configmap(void) {
     /* discard the volatile, it's only needed during the compile phase */

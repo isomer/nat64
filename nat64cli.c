@@ -1,8 +1,9 @@
 #include "nat64.h"
-#include <net/if.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 #include <xdp/libxdp.h>
 #include <assert.h>
 #include <errno.h>
@@ -10,6 +11,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <inttypes.h>
+
+static const char *pin_path = "/proc/sys/fs/nat64";
 
 enum {
     EXIT_FAIL_BPF = 1,
@@ -92,7 +95,7 @@ static bool find_program_by_predicate(int ifindex, predicate_t predicate, void *
 
 static bool init_configmap(struct xdp_program *prog) {
     struct bpf_object *bpf = xdp_program__bpf_obj(prog);
-    if (bpf_object__pin_maps(bpf, "/sys/fs/bpf/nat64") != 0) {
+    if (bpf_object__pin_maps(bpf, pin_path) != 0) {
         fprintf(stderr, "failed to pin maps\n");
     }
 
@@ -102,62 +105,103 @@ static bool init_configmap(struct xdp_program *prog) {
         return false;
     }
 
-    int fd = bpf_map__fd(map);
 
-    uint32_t key = 0;
-    configmap_t configmap;
-    if ((bpf_map_lookup_elem(fd, &key, &configmap)) != 0) {
-        fprintf(stderr,
-                "ERR: bpf_map_lookup_elem failed to find configmap entry");
+    return true; /* Success! */
+}
+
+static bool get_mac_address(const char *ifname, uint8_t mac_address[static ETH_ALEN]) {
+    struct ifreq ifr;
+
+    int fd = socket(PF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+        fprintf(stderr, "unable to get mac address\n");
+    }
+
+    strcpy(ifr.ifr_name, ifname);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) != 0) {
         return false;
     }
 
-    if (configmap.version != 0 && configmap.version != VERSION) {
-        fprintf(stderr,
-                "WARN: configmap has an unknown version\n");
+    memcpy(mac_address, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+
+    return true;
+}
+
+static bool load_program(const char *ifname, struct xdp_program **prog) {
+    char errmsg[1024];
+    int err = 0;
+
+    DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
+
+    int ifindex;
+    if ((ifindex = if_nametoindex(ifname)) == 0) {
+        fprintf(stderr, "Unknown interface %s\n", ifname);
+        return false;
     }
+
+    struct bpf_object *bpf_obj = bpf_object__open_file("nat64.bpf.o", NULL);
+    if (!bpf_obj) {
+        fprintf(stderr, "failed to open bpf program: %s", strerror(errno));
+        return false;
+    }
+
+    if ((err = bpf_object__load(bpf_obj)) != 0) {
+        libbpf_strerror(err, errmsg, sizeof(errmsg));
+        fprintf(stderr, "warning: Load failed: %s\n", errmsg);
+    }
+
+    struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, ".data");
+    if (!map) {
+        fprintf(stderr, "Failed to find config map\n");
+        return false;
+    }
+
+    printf("got configmap!\n");
+
+    if ((err = bpf_object__pin(bpf_obj, pin_path)) != 0) {
+        libbpf_strerror(err, errmsg, sizeof(errmsg));
+        fprintf(stderr, "Pinning failed: %s\n", errmsg);
+    }
+
+    /* patch the configuration */
+    int fd = bpf_map__fd(map);
+    if (fd == -1) {
+        fprintf(stderr, "Couldn't get map fd: %s\n", strerror(errno));
+    }
+
+    uint32_t key = 0;
+    configmap_t configmap;
 
     configmap = (configmap_t) {
         .version = VERSION,
         .success_action = XDP_TX,
         .ignore_action = XDP_DROP,
-        .v6_prefix = { },
-        .magic_mac = { },
-        .gateway_mac = { },
+        .v6_prefix = { 0x00, 0x64, 0xff, 0xfb, 0x00, 0x01, 0x00},
+        .magic_mac = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x64 },
         .ipv4_addr = { 192, 168, 4, 4 },
     };
 
-    if ((bpf_map_update_elem(fd, &key, &configmap, 0)) != 0) {
-        fprintf(stderr,
-                "ERR: Failed to update configmap\n");
+    if (!get_mac_address(ifname, configmap.gateway_mac)) {
+        fprintf(stderr, "Failed to get mac address\n");
         return false;
     }
 
-    return true; /* Success! */
-}
+    if ((bpf_map_update_elem(fd, &key, &configmap, 0)) != 0) {
+        fprintf(stderr,
+                "ERR: Failed to update configmap: %s\n", strerror(errno));
+        //return false;
+    }
 
-static bool load_program(int ifindex, struct xdp_program **prog) {
-    DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
-    DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
+    printf("building program from bpf object\n");
+    *prog = xdp_program__from_bpf_obj(bpf_obj, "xdp");
 
-    xdp_opts.open_filename = "nat64.bpf.o";
-	xdp_opts.prog_name = "xdp_nat64";
-	xdp_opts.opts = &opts;
+    if (!*prog) {
+        printf("failed to create xdp program\n");
+    }
 
-    *prog = xdp_program__create(&xdp_opts);
-
-    int err = libxdp_get_error(*prog);
-	if (err) {
-		char errmsg[1024];
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "ERR: creating program: %s\n", errmsg);
-        return false;
-	}
-
-    init_configmap(*prog);
-
+    printf("starting attachment\n");
     if ((err = xdp_program__attach(*prog, ifindex, XDP_MODE_SKB, 0)) != 0) {
-		char errmsg[1024];
 		libxdp_strerror(err, errmsg, sizeof(errmsg));
 		fprintf(stderr, "ERR: attaching program: %s\n", errmsg);
         return false;
@@ -171,21 +215,24 @@ int main(int argc, char *argv[]) {
     unsigned int ifindex = 0;
     struct xdp_program *prog = NULL;
     int mode = 0;
+    const char *ifname = argv[1];
 
-    if ((ifindex = if_nametoindex(argv[1])) == 0) {
-        fprintf(stderr, "Unknown interface %s\n", argv[1]);
-        return 1;
+    if ((ifindex = if_nametoindex(ifname)) == 0) {
+        fprintf(stderr, "Unknown interface %s\n", ifname);
+        return false;
     }
 
     if (find_program_by_predicate(ifindex, predicate_by_name, "xdp_nat64", &prog, &mode)) {
         fprintf(stderr, "Cleaning up old ebpf program\n");
         /* Remove the old copy */
         xdp_program__detach(prog, ifindex, mode, 0);
+        bpf_object__unpin(xdp_program__bpf_obj(prog), pin_path);
         prog = NULL;
     }
 
+    printf("Beginning program load\n");
 
-    if (!load_program(ifindex, &prog)) {
+    if (!load_program(ifname, &prog)) {
         fprintf(stderr, "Failed to load ebpf program\n");
         return 1;
     }
