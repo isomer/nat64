@@ -59,6 +59,7 @@
 #define LOG_IF(cond, msg, ...) do { if (UNLIKELY(cond)) LOG(msg, ##__VA_ARGS__); } while(0)
 
 #define MAX(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a > maxtmp_b ? maxtmp_a : maxtmp_b; })
+#define MIN(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a < maxtmp_b ? maxtmp_a : maxtmp_b; })
 
 typedef enum status_t {
     STATUS_SUCCESS, /* Successfully transformed */
@@ -308,8 +309,21 @@ static __always_inline struct in6_addr remap_v4_to_v6(struct in_addr addr) {
 }
 
 
+static __always_inline int mymemcmp(const void *dst, const void *src, size_t len) {
+    const uint8_t *d = dst;
+    const uint8_t *s = src;
+    for(size_t i = 0; i < MIN(len, (size_t)16); ++i) {
+        if (s[i] != d[i]) {
+            return d[i] - s[i];
+        }
+    }
+
+    return 0;
+}
+
+
 static __always_inline struct in_addr remap_v6_to_v4(struct in6_addr addr) {
-    if (memcmp(addr.s6_addr, configmap()->v6_prefix, sizeof(configmap()->v6_prefix)) == 0) {
+    if (mymemcmp(addr.s6_addr, configmap()->v6_prefix, configmap()->v6_prefixlen) == 0) {
         /* This is an IPv4 embedded in a v6 address, unpack it. */
         return (struct in_addr) {
             .s_addr = addr.s6_addr32[3],

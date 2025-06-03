@@ -177,9 +177,10 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
         .version = VERSION,
         .success_action = XDP_TX,
         .ignore_action = XDP_DROP,
-        .v6_prefix = { 0x00, 0x64, 0xff, 0xfb, 0x00, 0x01, 0x00},
+        .v6_prefix = { 0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0x00},
         .magic_mac = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x64 },
         .ipv4_addr = { 192, 168, 4, 4 },
+        .v6_prefixlen = 96/8,
     };
 
     if (!get_mac_address(ifname, configmap.gateway_mac)) {
@@ -243,6 +244,7 @@ int main(int argc, char *argv[]) {
         return false;
     }
 
+#if 0
     size_t num_cpu = libbpf_num_possible_cpus();
     int fd = bpf_map__fd(map);
     for(;;) {
@@ -267,6 +269,7 @@ int main(int argc, char *argv[]) {
 
         sleep(2);
     }
+#endif
 
     return 0;
 }

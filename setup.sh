@@ -11,7 +11,8 @@ ip link add $DEV type veth
 # Disable checksum offload.  Possibly only needed for debugging checksums
 ethtool -K veth0 tx-checksumming off rx-checksumming off
 
-ip link set dev $DEV xdpgeneric obj nat64.o sec xdp verbose
+#ip link set dev $DEV xdpgeneric obj nat64.o sec xdp verbose
+LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV
 
 ip link set up dev $DEV
 ip addr add 10.0.1.1/24 dev $DEV
