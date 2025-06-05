@@ -43,11 +43,8 @@ typedef struct configmap_t {
     int version;
     int success_action;
     int ignore_action;
-    uint8_t v6_prefix[16];
     uint8_t magic_mac[ETH_ALEN];
     uint8_t gateway_mac[ETH_ALEN];
-    uint8_t ipv4_addr[4];
-    uint8_t v6_prefixlen;
 } configmap_t;
 
 #endif

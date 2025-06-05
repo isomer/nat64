@@ -25,6 +25,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 long bpf_trace_printk(const char *restrict fmt, size_t fmt_size, ...) {
     assert(fmt[fmt_size-1] == '\0');
@@ -48,3 +49,12 @@ long bpf_xdp_adjust_head(struct xdp_md *ctx, int delta) {
     return 0;
 }
 
+void *bpf_map_lookup_elem(void *map, void *key) {
+    (void) map;
+    (void) key;
+    abort(); // TODO
+}
+
+void *nat64_4to6;
+void *nat64_6to4;
+void *nat64_scratch;

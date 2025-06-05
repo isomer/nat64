@@ -38,6 +38,7 @@ struct xdp_md {
 
 long bpf_trace_printk(const char *restrict fmt, size_t fmt_size, ...);
 long bpf_xdp_adjust_head(struct xdp_md *ctx, int delta);
+void *bpf_map_lookup_elem(void *map, void *key);
 
 enum {
     XDP_ABORTED = 0,
