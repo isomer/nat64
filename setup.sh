@@ -18,7 +18,6 @@ ethtool -K veth0 tx-checksumming off rx-checksumming off
 LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV
 
 ip link set up dev $DEV
-#ip addr add 10.0.1.1/24 dev $DEV
 
 ip link set up dev veth0
 ip addr add 100.64.0.1/10 metric 10 dev veth0
