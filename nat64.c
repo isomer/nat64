@@ -19,13 +19,10 @@
  */
 
 // rfc7915
-#include "nat64.h"
-#ifdef BPF
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#else
-#include "test_bpf.h"
-#endif
+
+#include "nat64.h"
 #include <net/ethernet.h>
 #include <netinet/ip6.h>
 #include <netinet/ip.h>
@@ -72,20 +69,10 @@ typedef enum status_t {
 #define RETURN_IF_ERR(x) do { status_t err = (x); if (err == STATUS_INVALID) LOG("invalid at %d", __LINE__); if (UNLIKELY(err != STATUS_SUCCESS)) return err; } while(0)
 #define RETURN_IF_NULL(x) do { if (UNLIKELY((x) == NULL)) return STATUS_INVALID; } while(0)
 
-typedef struct ipv4_prefix {
-    uint8_t len;
-    uint8_t prefix[4];
-} ipv4_prefix;
+static volatile configmap_t nat64_configmap = {
+    .version = VERSION,
+};
 
-typedef struct ipv6_prefix {
-    uint8_t len;
-    uint8_t prefix[16];
-} ipv6_prefix;
-
-enum { SCRATCH_SPACE = 1024 };
-
-
-#ifdef BPF
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, COUNTER_MAX);
@@ -120,21 +107,6 @@ struct {
     __uint(map_flags, BPF_F_RDONLY);
 } nat64_scratch SEC(".maps");
 
-#else
-uint64_t nat64_counters[COUNTER_MAX];
-
-extern void *nat64_4to6;
-extern void *nat64_6to4;
-extern void *nat64_scratch;
-
-#endif
-
-static volatile configmap_t nat64_configmap = {
-    .version = VERSION,
-};
-
-//#undef __always_inline
-//#define __always_inline
 
 static __always_inline const configmap_t *configmap(void) {
     /* discard the volatile, it's only needed during the compile phase */
@@ -142,15 +114,11 @@ static __always_inline const configmap_t *configmap(void) {
 }
 
 static __always_inline void increment_counter_by(counter_t counter, uint64_t value) {
-#ifdef BPF
     uint32_t key = counter;
     uint64_t *counter_value = bpf_map_lookup_elem(&nat64_counters, &key);
     if (counter_value) {
         __sync_fetch_and_add(counter_value, value);
     }
-#else
-    nat64_counters[counter] += value;
-#endif
 }
 
 
@@ -159,7 +127,7 @@ static __always_inline void increment_counter(counter_t counter) {
 }
 
 
-/* We have a very dumb bump allocator to move allocations off the (tiny) stack.
+/* We have a very dumb bump arena allocator to move allocations off the (tiny) stack.
  *
  * This is done by having a per cpu array map with 1 entry, which is used as scratch space.
  * A bump allocator will allocate space from this entry.
@@ -196,11 +164,6 @@ static __always_inline __attribute__((malloc)) void *allocate_scratch(size_t siz
 
 static __always_inline uint16_t u8_combine(uint8_t hi, uint8_t lo) {
     return ((uint16_t)hi << 8) | lo;
-}
-
-
-static __always_inline uint16_t u32_combine(uint32_t value) {
-    return ((value >> 16) & 0xFFFF) | (value & 0xFFFF);
 }
 
 
@@ -390,13 +353,17 @@ static __always_inline status_t remap_v4_to_v6(struct in_addr addr, struct in6_a
      * verifier happy we have a fallback as an obviously invalid address that
      * also includes the v4 address to make debugging easier.
      */
+    ipv4_prefix v4 = {
+        .len = 4,
+        .prefix = addr,
+    };
     const ipv6_prefix *v6 = NULL;
-    if ((v6 = bpf_map_lookup_elem(&nat64_4to6, &addr.s_addr)) == NULL) {
+    if ((v6 = bpf_map_lookup_elem(&nat64_4to6, &v4)) == NULL) {
         LOG("Failed to lookup v4 to v6: %08x", ntohl(addr.s_addr));
         return STATUS_FAILED;
     }
 
-    memcpy(out->s6_addr, v6->prefix, sizeof(out->s6_addr));
+    memcpy(out->s6_addr, &v6->prefix, sizeof(out->s6_addr));
 
     if (v6->len <= 96) {
         out->s6_addr32[3] = addr.s_addr;
@@ -407,12 +374,22 @@ static __always_inline status_t remap_v4_to_v6(struct in_addr addr, struct in6_a
 
 static __always_inline status_t remap_v6_to_v4(struct in6_addr addr, struct in_addr *out) {
     ipv4_prefix *v4;
-    if ((v4 = bpf_map_lookup_elem(&nat64_6to4, addr.s6_addr)) != NULL) {
-        memcpy(&out->s_addr, &v4->prefix, sizeof(out->s_addr));
+    ipv6_prefix v6 = {
+        .len = 128,
+        .prefix = addr,
+    };
+    if ((v4 = bpf_map_lookup_elem(&nat64_6to4, &v6)) != NULL) {
+        uint64_t mask = (0xFFFFFFFFU << (32 - v4->len)) & 0xFFFFFFFF;
+        out->s_addr = htonl(
+                (ntohl(v4->prefix.s_addr) & mask)
+                | (ntohl(addr.s6_addr32[3]) & ~mask));
         return STATUS_SUCCESS;
     }
 
     /* TODO: Dynamically allocate an IP address */
+    LOG("Failed to map v6 addr %08x..%08x to v4",
+            ntohl(addr.s6_addr32[0]),
+            ntohl(addr.s6_addr32[3]));
     return STATUS_FAILED;
 }
 
@@ -423,7 +400,7 @@ static __always_inline status_t construct_v4_from_v6(__arg_nonnull const struct 
     out->ip_tos = (ntohl(ip6->ip6_flow) >> 20) & 0xFF;
     out->ip_len = htons(ntohs(ip6->ip6_plen) + out->ip_hl * 4);
     out->ip_id = 0x00; /* TODO: Handle fragmentation */
-    out->ip_off = IP_DF | 0x00; // TODO: Handle fragmentation
+    out->ip_off = htons(IP_DF | 0x00); // TODO: Handle fragmentation
     out->ip_ttl = ip6->ip6_hlim;
     out->ip_p = (ip6->ip6_nxt == IPPROTO_ICMPV6) ? IPPROTO_ICMP : ip6->ip6_nxt;
     out->ip_sum = 0x0000;

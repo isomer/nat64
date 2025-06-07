@@ -1,18 +1,21 @@
+//#include <linux/bpf.h>
+//#include <bpf/bpf_helpers.h>
+#include <xdp/libxdp.h>
+
 #include "nat64.h"
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
-#include <xdp/libxdp.h>
 #include <assert.h>
 #include <errno.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <unistd.h>
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-static const char *pin_path = "/proc/sys/fs/nat64";
+static const char *pin_path = "/proc/sys/fs/nat64/";
 
 enum {
     EXIT_FAIL_BPF = 1,
@@ -93,22 +96,6 @@ static bool find_program_by_predicate(int ifindex, predicate_t predicate, void *
 }
 
 
-static bool init_configmap(struct xdp_program *prog) {
-    struct bpf_object *bpf = xdp_program__bpf_obj(prog);
-    if (bpf_object__pin_maps(bpf, pin_path) != 0) {
-        fprintf(stderr, "failed to pin maps\n");
-    }
-
-    struct bpf_map *map = bpf_object__find_map_by_name(bpf, "nat64_configmap");
-    if (!map) {
-        fprintf(stderr, "Failed to find config map\n");
-        return false;
-    }
-
-
-    return true; /* Success! */
-}
-
 static bool get_mac_address(const char *ifname, uint8_t mac_address[static ETH_ALEN]) {
     struct ifreq ifr;
 
@@ -168,6 +155,7 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
     int fd = bpf_map__fd(map);
     if (fd == -1) {
         fprintf(stderr, "Couldn't get map fd: %s\n", strerror(errno));
+        return false;
     }
 
     uint32_t key = 0;
@@ -188,8 +176,87 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
     if ((bpf_map_update_elem(fd, &key, &configmap, 0)) != 0) {
         fprintf(stderr,
                 "ERR: Failed to update configmap: %s\n", strerror(errno));
-        //return false;
+        return false;
     }
+
+    /* Set up the address maps */
+    struct bpf_map *nat64_6to4 = bpf_object__find_map_by_name(bpf_obj, "nat64_6to4");
+    if (!nat64_6to4) {
+        fprintf(stderr, "Couldn't find nat64_6to4 map\n");
+        return false;
+    }
+
+    int nat64_6to4_fd = -1;
+    if ((nat64_6to4_fd = bpf_map__fd(nat64_6to4)) == -1) {
+        fprintf(stderr, "Failed to get nat64_6to4 fd\n");
+        return false;
+    }
+
+    struct bpf_map *nat64_4to6 = bpf_object__find_map_by_name(bpf_obj, "nat64_4to6");
+    if (!nat64_4to6) {
+        fprintf(stderr, "Couldn't find nat64_4to6 map\n");
+        return false;
+    }
+
+    int nat64_4to6_fd = -1;
+    if ((nat64_4to6_fd = bpf_map__fd(nat64_4to6)) == -1) {
+        fprintf(stderr, "Failed to get nat64_4to6 fd\n");
+        return false;
+    }
+
+    ipv6_prefix v6 = {
+        .len = 96,
+        .prefix.s6_addr = {
+            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        },
+    };
+
+    ipv4_prefix v4 = {
+        .len = 0,
+        .prefix.s_addr = htonl(0),
+    };
+
+    /* map 0.0.0.0/0 <=> 64:ff9b::/96 */
+    if ((err = bpf_map_update_elem(nat64_6to4_fd, &v6, &v4, BPF_ANY)) != 0) {
+        libbpf_strerror(err, errmsg, sizeof(errmsg));
+        fprintf(stderr, "Error adding 6to4 mapping: %s\n", errmsg);
+    }
+
+    if ((err = bpf_map_update_elem(nat64_4to6_fd, &v4, &v6, BPF_ANY)) != 0) {
+        libbpf_strerror(err, errmsg, sizeof(errmsg));
+        fprintf(stderr, "Error adding 4to6 mapping: %s\n", errmsg);
+    }
+
+    /* map ::/0 to 100.64.0.1 */
+    v4 = (ipv4_prefix) {
+        .len = 32,
+        .prefix.s_addr = inet_addr("100.64.0.1"),
+    };
+    v6 = (ipv6_prefix) {
+        .len = 0,
+        .prefix.s6_addr16 = { 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    if ((err = bpf_map_update_elem(nat64_6to4_fd, &v6, &v4, BPF_ANY)) != 0) {
+        libbpf_strerror(err, errmsg, sizeof(errmsg));
+        fprintf(stderr, "Error adding default 6to4 mapping: %s\n", errmsg);
+    }
+
+    ipv6_prefix test_prefix = {
+        .len = 128,
+        .prefix = {
+            .s6_addr = {
+                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x01, 0x01
+            }
+        }
+    };
+    struct ipv4_prefix result;
+    int ret = bpf_map_lookup_elem(nat64_6to4_fd, &test_prefix, &result);
+    libbpf_strerror(ret, errmsg, sizeof(errmsg));
+    fprintf(stderr, "self test status: %s\n", errmsg);
+    fprintf(stderr, "result: %s/%d\n", inet_ntoa(result.prefix), result.len);
 
     printf("building program from bpf object\n");
     *prog = xdp_program__from_bpf_obj(bpf_obj, "xdp");

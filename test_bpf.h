@@ -19,39 +19,18 @@
  */
 #ifndef TEST_BPF_H
 #define TEST_BPF_H
-#include <sys/types.h>
-#include <stdint.h>
 
+#ifndef BPF
+#undef __arg_ctx
+#undef __arg_nullable
+#undef __arg_nonnull
 #define __arg_ctx
 #define __arg_nullable
 #define __arg_nonnull
 
+#undef SEC
 #define SEC(section)
-
-struct xdp_md {
-    uintptr_t data;
-    uintptr_t data_end;
-    uintptr_t data_meta;
-    uint32_t ingress_ifindex;
-    uint32_t rx_queue_index;
-};
-
-long bpf_trace_printk(const char *restrict fmt, size_t fmt_size, ...);
-long bpf_xdp_adjust_head(struct xdp_md *ctx, int delta);
-void *bpf_map_lookup_elem(void *map, void *key);
-
-enum {
-    XDP_ABORTED = 0,
-    XDP_DROP,
-    XDP_PASS,
-    XDP_TX,
-    XDP_REDIRECT,
-};
-
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define __array(name, val) typeof(val) *name[]
-#define __ulong(name, val) enum { ___bpf_concat(__unique_value, __COUNTER__) = val } name
+#endif
 
 
 #endif

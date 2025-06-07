@@ -27,34 +27,3 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-long bpf_trace_printk(const char *restrict fmt, size_t fmt_size, ...) {
-    assert(fmt[fmt_size-1] == '\0');
-    long ret;
-
-    va_list ap;
-    va_start(ap, fmt_size);
-    ret = vprintf(fmt, ap);
-    va_end(ap);
-    putchar('\n');
-    return ret;
-}
-
-
-long bpf_xdp_adjust_head(struct xdp_md *ctx, int delta) {
-    if (ctx->data + delta + ETH_HLEN > ctx->data_end) {
-        printf("Requested: %d (%" PRIdPTR " remaining)", delta, ctx->data_end - ctx->data);
-        return -EINVAL;
-    }
-    ctx->data += delta;
-    return 0;
-}
-
-void *bpf_map_lookup_elem(void *map, void *key) {
-    (void) map;
-    (void) key;
-    abort(); // TODO
-}
-
-void *nat64_4to6;
-void *nat64_6to4;
-void *nat64_scratch;

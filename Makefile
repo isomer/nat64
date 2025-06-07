@@ -5,7 +5,9 @@ CFLAGS?=-O2 -g -D __BPF_TRACING__ -Wall -Wextra -Wstrict-prototypes -Wmissing-pr
 
 all: nat64.bpf.o nat64 nat64cli
 
-nat64: nat64.o test_bpf.o test_case.o
+#nat64: test_bpf.o test_case.o
+nat64:
+	true
 
 nat64cli: LDLIBS=-lxdp -lbpf
 

@@ -19,8 +19,13 @@
  */
 #ifndef NAT64_H
 #define NAT64_H
+#include <netinet/ip6.h>
+#include <netinet/ip.h>
+#include "test_bpf.h"
 #include <stdint.h>
 #include <net/ethernet.h>
+
+enum { SCRATCH_SPACE = 1024 };
 
 typedef enum {
     COUNTER_INVALID_IPVER,
@@ -46,5 +51,17 @@ typedef struct configmap_t {
     uint8_t magic_mac[ETH_ALEN];
     uint8_t gateway_mac[ETH_ALEN];
 } configmap_t;
+
+typedef struct ipv4_prefix {
+    uint32_t len;
+    struct in_addr prefix;
+} ipv4_prefix;
+
+typedef struct ipv6_prefix {
+    uint32_t len;
+    struct in6_addr prefix;
+} ipv6_prefix;
+
+
 
 #endif
