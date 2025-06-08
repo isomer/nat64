@@ -44,10 +44,16 @@ typedef enum {
 
 enum { VERSION = 1 };
 
+typedef enum {
+    DST_MAC_GW = 1,
+    DST_MAC_REFLECT = 2
+} dest_mac_mode_t;
+
 typedef struct configmap_t {
     int version;
     int success_action;
     int ignore_action;
+    dest_mac_mode_t dst_mac_mode;
     uint8_t magic_mac[ETH_ALEN];
     uint8_t gateway_mac[ETH_ALEN];
 } configmap_t;

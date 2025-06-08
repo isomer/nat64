@@ -165,6 +165,7 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
         .version = VERSION,
         .success_action = XDP_TX,
         .ignore_action = XDP_DROP,
+        .dst_mac_mode = DST_MAC_REFLECT,
         .magic_mac = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x64 },
     };
 

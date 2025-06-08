@@ -961,8 +961,12 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
             return STATUS_FAILED;
 
         /* Build a new header */
-        memcpy(newhdr->ether_dhost, configmap()->gateway_mac, ETH_ALEN);
-        memcpy(newhdr->ether_shost, ethhdr->ether_dhost, ETH_ALEN);
+        switch(configmap()->dst_mac_mode) {
+            case DST_MAC_GW: memcpy(newhdr->ether_dhost, configmap()->gateway_mac, ETH_ALEN); break;
+            case DST_MAC_REFLECT: memcpy(newhdr->ether_dhost, ethhdr->ether_shost, ETH_ALEN); break;
+        }
+
+        memcpy(newhdr->ether_shost, configmap()->magic_mac, ETH_ALEN);
         newhdr->ether_type = ethhdr->ether_type;
 
         /* Discard the old header */

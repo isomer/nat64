@@ -22,14 +22,14 @@ ip link set up dev $DEV
 ip link set up dev veth0
 ip addr add 100.64.0.1/10 metric 10 dev veth0
 
-ip neigh add fe80::64 lladdr $MAGICMAC dev veth0 ||
-    ip neigh replace fe80::64 lladdr $MAGICMAC dev veth0
-ip neigh add 100.64.0.64 lladdr $MAGICMAC dev veth0 ||
-    ip neigh replace 100.64.0.64 lladdr $MAGICMAC dev veth0
+ip neigh add $NATIP6 lladdr $MAGICMAC dev veth0 ||
+    ip neigh replace $NATIP6 lladdr $MAGICMAC dev veth0
+ip neigh add $NATIP4 lladdr $MAGICMAC dev veth0 ||
+    ip neigh replace $NATIP4 lladdr $MAGICMAC dev veth0
 
-ip route add $V6PREFIX::/96 via fe80::64 dev veth0
+ip route add $V6PREFIX::/96 via $NATIP6 dev veth0
 
-ip route add 192.168.4.4 via 100.64.0.64 dev veth0
+ip route add 192.168.4.4 via $NATIP4 dev veth0
 ip neigh add proxy 192.168.4.4 dev wireless
 ip addr add $V6PREFIX::192.168.4.4 dev veth0
 
