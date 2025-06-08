@@ -129,9 +129,6 @@ static bool get_mac_address(const char *ifname, uint8_t mac_address[static ETH_A
 }
 
 static bool load_program(const char *ifname, struct bpf_object **prog) {
-    char errmsg[1024];
-    int err = 0;
-
     DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
 
     int ifindex;
@@ -146,12 +143,20 @@ static bool load_program(const char *ifname, struct bpf_object **prog) {
         return false;
     }
 
-    if ((err = bpf_object__load(*prog)) != 0) {
+	return true;
+}
+
+
+static bool configure_program(const char *ifname, struct bpf_object *prog) {
+    char errmsg[1024];
+    int err = 0;
+
+    if ((err = bpf_object__load(prog)) != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "warning: Load failed: %s\n", errmsg);
     }
 
-    struct bpf_map *map = bpf_object__find_map_by_name(*prog, ".data");
+    struct bpf_map *map = bpf_object__find_map_by_name(prog, ".data");
     if (!map) {
         fprintf(stderr, "Failed to find config map\n");
         return false;
@@ -159,7 +164,7 @@ static bool load_program(const char *ifname, struct bpf_object **prog) {
 
     printf("got configmap!\n");
 
-    if ((err = bpf_object__pin(*prog, pin_path)) != 0) {
+    if ((err = bpf_object__pin(prog, pin_path)) != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "Pinning failed: %s\n", errmsg);
     }
@@ -194,7 +199,7 @@ static bool load_program(const char *ifname, struct bpf_object **prog) {
     }
 
     /* Set up the address maps */
-    struct bpf_map *nat64_6to4 = bpf_object__find_map_by_name(*prog, "nat64_6to4");
+    struct bpf_map *nat64_6to4 = bpf_object__find_map_by_name(prog, "nat64_6to4");
     if (!nat64_6to4) {
         fprintf(stderr, "Couldn't find nat64_6to4 map\n");
         return false;
@@ -206,7 +211,7 @@ static bool load_program(const char *ifname, struct bpf_object **prog) {
         return false;
     }
 
-    struct bpf_map *nat64_4to6 = bpf_object__find_map_by_name(*prog, "nat64_4to6");
+    struct bpf_map *nat64_4to6 = bpf_object__find_map_by_name(prog, "nat64_4to6");
     if (!nat64_4to6) {
         fprintf(stderr, "Couldn't find nat64_4to6 map\n");
         return false;
@@ -275,6 +280,7 @@ static bool load_program(const char *ifname, struct bpf_object **prog) {
 	return true;
 }
 
+
 static bool attach_program(const char *ifname, struct bpf_object *bpf_prog) {
     char errmsg[1024];
     int err = 0;
@@ -330,8 +336,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (!configure_program(ifname, prog)) {
+        fprintf(stderr, "Failed to configure ebpf program\n");
+    }
+
     if (!attach_program(ifname, prog)) {
-        fprintf(stderr, "Failed to load ebpf program\n");
+        fprintf(stderr, "Failed to attach ebpf program\n");
         return 1;
     }
 
