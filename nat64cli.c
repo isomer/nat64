@@ -17,6 +17,19 @@
 
 static const char *pin_path = "/proc/sys/fs/nat64/";
 
+typedef struct map_t {
+    ipv4_prefix v4;
+    ipv6_prefix v6;
+    enum {
+        MAP_4TO6,
+        MAP_6TO4,
+        MAP_BOTH,
+    } map;
+    struct map_t *next;
+} map_t;
+
+static map_t *addr_map = NULL;
+
 enum {
     EXIT_FAIL_BPF = 1,
 };
@@ -115,7 +128,7 @@ static bool get_mac_address(const char *ifname, uint8_t mac_address[static ETH_A
     return true;
 }
 
-static bool load_program(const char *ifname, struct xdp_program **prog) {
+static bool load_program(const char *ifname, struct bpf_object **prog) {
     char errmsg[1024];
     int err = 0;
 
@@ -127,18 +140,18 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
         return false;
     }
 
-    struct bpf_object *bpf_obj = bpf_object__open_file("nat64.bpf.o", NULL);
-    if (!bpf_obj) {
+    *prog = bpf_object__open_file("nat64.bpf.o", NULL);
+    if (!prog) {
         fprintf(stderr, "failed to open bpf program: %s", strerror(errno));
         return false;
     }
 
-    if ((err = bpf_object__load(bpf_obj)) != 0) {
+    if ((err = bpf_object__load(*prog)) != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "warning: Load failed: %s\n", errmsg);
     }
 
-    struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, ".data");
+    struct bpf_map *map = bpf_object__find_map_by_name(*prog, ".data");
     if (!map) {
         fprintf(stderr, "Failed to find config map\n");
         return false;
@@ -146,7 +159,7 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
 
     printf("got configmap!\n");
 
-    if ((err = bpf_object__pin(bpf_obj, pin_path)) != 0) {
+    if ((err = bpf_object__pin(*prog, pin_path)) != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "Pinning failed: %s\n", errmsg);
     }
@@ -181,7 +194,7 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
     }
 
     /* Set up the address maps */
-    struct bpf_map *nat64_6to4 = bpf_object__find_map_by_name(bpf_obj, "nat64_6to4");
+    struct bpf_map *nat64_6to4 = bpf_object__find_map_by_name(*prog, "nat64_6to4");
     if (!nat64_6to4) {
         fprintf(stderr, "Couldn't find nat64_6to4 map\n");
         return false;
@@ -193,7 +206,7 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
         return false;
     }
 
-    struct bpf_map *nat64_4to6 = bpf_object__find_map_by_name(bpf_obj, "nat64_4to6");
+    struct bpf_map *nat64_4to6 = bpf_object__find_map_by_name(*prog, "nat64_4to6");
     if (!nat64_4to6) {
         fprintf(stderr, "Couldn't find nat64_4to6 map\n");
         return false;
@@ -259,15 +272,28 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
     fprintf(stderr, "self test status: %s\n", errmsg);
     fprintf(stderr, "result: %s/%d\n", inet_ntoa(result.prefix), result.len);
 
-    printf("building program from bpf object\n");
-    *prog = xdp_program__from_bpf_obj(bpf_obj, "xdp");
+	return true;
+}
 
-    if (!*prog) {
+static bool attach_program(const char *ifname, struct bpf_object *bpf_prog) {
+    char errmsg[1024];
+    int err = 0;
+    int ifindex = -1;
+
+    if ((ifindex = if_nametoindex(ifname)) == 0) {
+        fprintf(stderr, "Unknown interface %s\n", ifname);
+        return false;
+    }
+
+    printf("building program from bpf object\n");
+    struct xdp_program *prog = xdp_program__from_bpf_obj(bpf_prog, "xdp");
+
+    if (!prog) {
         printf("failed to create xdp program\n");
     }
 
     printf("starting attachment\n");
-    if ((err = xdp_program__attach(*prog, ifindex, XDP_MODE_SKB, 0)) != 0) {
+    if ((err = xdp_program__attach(prog, ifindex, XDP_MODE_SKB, 0)) != 0) {
 		libxdp_strerror(err, errmsg, sizeof(errmsg));
 		fprintf(stderr, "ERR: attaching program: %s\n", errmsg);
         return false;
@@ -279,7 +305,8 @@ static bool load_program(const char *ifname, struct xdp_program **prog) {
 
 int main(int argc, char *argv[]) {
     unsigned int ifindex = 0;
-    struct xdp_program *prog = NULL;
+    struct bpf_object *prog = NULL;
+    struct xdp_program *xdpprog = NULL;
     int mode = 0;
     const char *ifname = argv[1];
 
@@ -288,11 +315,11 @@ int main(int argc, char *argv[]) {
         return false;
     }
 
-    if (find_program_by_predicate(ifindex, predicate_by_name, "xdp_nat64", &prog, &mode)) {
+    if (find_program_by_predicate(ifindex, predicate_by_name, "xdp_nat64", &xdpprog, &mode)) {
         fprintf(stderr, "Cleaning up old ebpf program\n");
         /* Remove the old copy */
-        xdp_program__detach(prog, ifindex, mode, 0);
-        bpf_object__unpin(xdp_program__bpf_obj(prog), pin_path);
+        xdp_program__detach(xdpprog, ifindex, mode, 0);
+        bpf_object__unpin(xdp_program__bpf_obj(xdpprog), pin_path);
         prog = NULL;
     }
 
@@ -303,7 +330,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct bpf_map *map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "nat64_counters");
+    if (!attach_program(ifname, prog)) {
+        fprintf(stderr, "Failed to load ebpf program\n");
+        return 1;
+    }
+
+    struct bpf_map *map = bpf_object__find_map_by_name(prog, "nat64_counters");
     if (!map) {
         fprintf(stderr, "Failed to find config map\n");
         return false;
