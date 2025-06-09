@@ -1,5 +1,6 @@
 #!/bin/sh
 set -xe
+ulimit -c unlimited
 
 DEV=test0
 NATIP4=100.64.0.64
@@ -15,7 +16,15 @@ ip link add $DEV type veth
 ethtool -K veth0 tx-checksumming off rx-checksumming off
 
 #ip link set dev $DEV xdpgeneric obj nat64.o sec xdp verbose
-LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV
+LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV \
+    gateway reflect \
+    mac 02:00:00:00:00:64 \
+    success tx \
+    ignore drop \
+    map 64:ff9b::/96 0.0.0.0/0 \
+    map 0.0.0.0/0 64:ff9b::/96 \
+    map ::/0 100.64.0.1/32 \
+    stats
 
 ip link set up dev $DEV
 
