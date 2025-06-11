@@ -847,15 +847,13 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
 
     uint8_t protocol = iphdr->ip_p;
 
-    struct ip6_hdr *ip6hdr;
-    if ((ip6hdr = allocate_scratch(sizeof(struct ip6_hdr))) == NULL)
-        return STATUS_FAILED;
-    RETURN_IF_ERR(construct_v6_from_v4(iphdr, ip6hdr));
+    struct ip6_hdr ip6hdr;
+    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ip6hdr));
 
     /* TODO: Handle fragmented IPv4 packet */
 
     uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
-    uint32_t new_netsum = pseudo_netsum_from_ipv6(ip6hdr);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6hdr);
 
     /* Strip off the old IPv4 header */
     RETURN_IF_ERR(pop_header(ctx, sizeof(struct ip), NULL));
@@ -883,10 +881,10 @@ static __always_inline status_t process_ipv4(__arg_ctx struct xdp_md *ctx) {
             LOG("Unknown IPv4 protocol %d", protocol);
     }
 
-    ip6hdr->ip6_plen = htons(packet_len(ctx));
+    ip6hdr.ip6_plen = htons(packet_len(ctx));
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx, ip6hdr, sizeof(*ip6hdr), NULL));
+    RETURN_IF_ERR(push_header(ctx, &ip6hdr, sizeof(ip6hdr), NULL));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
