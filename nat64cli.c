@@ -151,114 +151,6 @@ static bool load_program(struct bpf_object **prog) {
 }
 
 
-#if 0
-static bool configure_program(const char *ifname, struct bpf_object *prog) {
-    char errmsg[1024];
-    int err = 0;
-
-    struct bpf_map *map = bpf_object__find_map_by_name(prog, ".data");
-    if (!map) {
-        fprintf(stderr, "Failed to find config map\n");
-        return false;
-    }
-
-    printf("got configmap!\n");
-
-    if ((err = bpf_object__pin(prog, pin_path)) != 0) {
-        libbpf_strerror(err, errmsg, sizeof(errmsg));
-        fprintf(stderr, "Pinning failed: %s\n", errmsg);
-    }
-
-    /* patch the configuration */
-    int fd = bpf_map__fd(map);
-    if (fd == -1) {
-        fprintf(stderr, "Couldn't get map fd: %s\n", strerror(errno));
-        return false;
-    }
-
-    uint32_t key = 0;
-    configmap_t configmap;
-
-    configmap = (configmap_t) {
-        .version = VERSION,
-        .success_action = XDP_TX,
-        .ignore_action = XDP_DROP,
-        .dst_mac_mode = DST_MAC_REFLECT,
-        .magic_mac = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x64 },
-    };
-
-    if (!get_mac_address(ifname, configmap.gateway_mac)) {
-        fprintf(stderr, "Failed to get mac address\n");
-        return false;
-    }
-
-    if ((bpf_map_update_elem(fd, &key, &configmap, 0)) != 0) {
-        fprintf(stderr,
-                "ERR: Failed to update configmap: %s\n", strerror(errno));
-        return false;
-    }
-
-    /* Set up the address maps */
-
-    ipv6_prefix v6 = {
-        .len = 96,
-        .prefix.s6_addr = {
-            0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        },
-    };
-
-    ipv4_prefix v4 = {
-        .len = 0,
-        .prefix.s_addr = htonl(0),
-    };
-
-    /* map 0.0.0.0/0 <=> 64:ff9b::/96 */
-    if ((err = bpf_map_update_elem(nat64_6to4_fd, &v6, &v4, BPF_ANY)) != 0) {
-        libbpf_strerror(err, errmsg, sizeof(errmsg));
-        fprintf(stderr, "Error adding 6to4 mapping: %s\n", errmsg);
-    }
-
-    if ((err = bpf_map_update_elem(nat64_4to6_fd, &v4, &v6, BPF_ANY)) != 0) {
-        libbpf_strerror(err, errmsg, sizeof(errmsg));
-        fprintf(stderr, "Error adding 4to6 mapping: %s\n", errmsg);
-    }
-
-    /* map ::/0 to 100.64.0.1 */
-    v4 = (ipv4_prefix) {
-        .len = 32,
-        .prefix.s_addr = inet_addr("100.64.0.1"),
-    };
-    v6 = (ipv6_prefix) {
-        .len = 0,
-        .prefix.s6_addr16 = { 0, 0, 0, 0, 0, 0, 0, 0 },
-    };
-
-    if ((err = bpf_map_update_elem(nat64_6to4_fd, &v6, &v4, BPF_ANY)) != 0) {
-        libbpf_strerror(err, errmsg, sizeof(errmsg));
-        fprintf(stderr, "Error adding default 6to4 mapping: %s\n", errmsg);
-    }
-
-    ipv6_prefix test_prefix = {
-        .len = 128,
-        .prefix = {
-            .s6_addr = {
-                0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x01, 0x01
-            }
-        }
-    };
-    struct ipv4_prefix result;
-    int ret = bpf_map_lookup_elem(nat64_6to4_fd, &test_prefix, &result);
-    libbpf_strerror(ret, errmsg, sizeof(errmsg));
-    fprintf(stderr, "self test status: %s\n", errmsg);
-    fprintf(stderr, "result: %s/%d\n", inet_ntoa(result.prefix), result.len);
-
-	return true;
-}
-#endif
-
-
 static bool attach_program(int ifindex, struct xdp_program *prog) {
     char errmsg[1024];
     int err = 0;
@@ -442,22 +334,22 @@ int main(int argc, const char *argv[]) {
 
     if ((configmap_fd = bpf_map__fd(datamap)) == -1) {
         fprintf(stderr, "Failed to get configmap fd\n");
-        return false;
+        return 1;
     }
 
     if ((counters_fd = bpf_map__fd(counters_map)) == -1) {
         fprintf(stderr, "Failed to get counters fd\n");
-        return false;
+        return 1;
     }
 
     if ((nat64_6to4_fd = bpf_map__fd(nat64_6to4)) == -1) {
         fprintf(stderr, "Failed to get nat64_6to4 fd\n");
-        return false;
+        return 1;
     }
 
     if ((nat64_4to6_fd = bpf_map__fd(nat64_4to6)) == -1) {
         fprintf(stderr, "Failed to get nat64_4to6 fd\n");
-        return false;
+        return 1;
     }
 
     configmap_t configmap = { .version = 0 };
