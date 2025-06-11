@@ -956,43 +956,41 @@ static __always_inline status_t process_ethernet(__arg_ctx struct xdp_md *ctx) {
 
     /* Is this to the magic ethernet address? */
     if (memcmp(configmap()->magic_mac, ethhdr->ether_dhost, sizeof(configmap()->magic_mac)) == 0) {
-        struct ether_header *newhdr;
-        if ((newhdr = allocate_scratch(sizeof(struct ether_header))) == NULL)
-            return STATUS_FAILED;
+        struct ether_header newhdr;
 
         /* Build a new header */
         switch(configmap()->dst_mac_mode) {
-            case DST_MAC_GW: memcpy(newhdr->ether_dhost, configmap()->gateway_mac, ETH_ALEN); break;
-            case DST_MAC_REFLECT: memcpy(newhdr->ether_dhost, ethhdr->ether_shost, ETH_ALEN); break;
+            case DST_MAC_GW: memcpy(newhdr.ether_dhost, configmap()->gateway_mac, ETH_ALEN); break;
+            case DST_MAC_REFLECT: memcpy(newhdr.ether_dhost, ethhdr->ether_shost, ETH_ALEN); break;
         }
 
-        memcpy(newhdr->ether_shost, configmap()->magic_mac, ETH_ALEN);
-        newhdr->ether_type = ethhdr->ether_type;
+        memcpy(newhdr.ether_shost, configmap()->magic_mac, ETH_ALEN);
+        newhdr.ether_type = ethhdr->ether_type;
 
         /* Discard the old header */
-        RETURN_IF_ERR(pop_header(ctx, sizeof(*newhdr), NULL));
+        RETURN_IF_ERR(pop_header(ctx, sizeof(newhdr), NULL));
 
         status_t ret;
 
-        switch (ntohs(newhdr->ether_type)) {
+        switch (ntohs(newhdr.ether_type)) {
             case ETHERTYPE_IP:
-                newhdr->ether_type = htons(ETHERTYPE_IPV6);
+                newhdr.ether_type = htons(ETHERTYPE_IPV6);
                 ret = process_ipv4(ctx);
                 break;
 
             case ETHERTYPE_IPV6:
-                newhdr->ether_type = htons(ETHERTYPE_IP);
+                newhdr.ether_type = htons(ETHERTYPE_IP);
                 ret = process_ipv6(ctx);
                 break;
 
             default:
-                LOG("Unknown ethertype %04x", ntohs(newhdr->ether_type));
+                LOG("Unknown ethertype %04x", ntohs(newhdr.ether_type));
                 increment_counter(COUNTER_UNKNOWN_ETHERTYPE);
                 return STATUS_DROP;
         }
 
         /* Now push our new ethernet header back on the front */
-        RETURN_IF_ERR(push_header(ctx, newhdr, sizeof(*newhdr), NULL));
+        RETURN_IF_ERR(push_header(ctx, &newhdr, sizeof(newhdr), NULL));
         LOG("Done with status %d", ret);
         return ret;
     } else {
