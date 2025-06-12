@@ -21,8 +21,8 @@ LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV \
     mac 02:00:00:00:00:64 \
     success tx \
     ignore drop \
-    map 64:ff9b::/96 0.0.0.0/0 \
-    map 0.0.0.0/0 64:ff9b::/96 \
+    map $V6PREFIX::/96 0.0.0.0/0 \
+    map 0.0.0.0/0 $V6PREFIX::/96 \
     map ::/0 100.64.0.1/32 \
     stats
 
@@ -48,4 +48,4 @@ echo 1 | tee \
     /proc/sys/net/ipv4/conf/wireless/forwarding
 
 # Tail the trace log, when you press ^C, dump the counters
-cat /sys/kernel/tracing/trace_pipe || bpftool map dump name nat64_counters
+cat /sys/kernel/tracing/trace_pipe
