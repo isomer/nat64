@@ -23,7 +23,7 @@ LIBXDP_SKIP_DISPATCHER=1 ./nat64cli $DEV \
     ignore drop \
     map $V6PREFIX::/96 0.0.0.0/0 \
     map 0.0.0.0/0 $V6PREFIX::/96 \
-    map ::/0 100.64.0.1/32 \
+    dynamic 100.64.0.0/27 \
     stats
 
 ip link set up dev $DEV

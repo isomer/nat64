@@ -1,3 +1,22 @@
+/* SPDX-License-Identifier: GPL-2.0
+ *
+ *  CLI tool for managing nat64 ebpf program
+ *  Copyright (C) 2025  Perry Lorier
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 #include <xdp/libxdp.h>
 
 #include "nat64.h"
@@ -145,6 +164,7 @@ static bool load_program(struct bpf_object **prog) {
     if ((err = bpf_object__load(*prog)) != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "warning: Load failed: %s\n", errmsg);
+        return false;
     }
 
 	return true;
@@ -179,10 +199,11 @@ static void usage(const char *argv0) {
     fprintf(stderr, "%s <ifname> unload\n", argv0);
     fprintf(stderr, "%s <ifname> [reload] {OPTIONS...}\n", argv0);
     fprintf(stderr, "  OPTIONS := gateway (<gatewaymac>|reflect)\n");
-    fprintf(stderr, "             mac <gatewaymac>\n");
-    fprintf(stderr, "             success (pass|drop|tx)\n");
-    fprintf(stderr, "             ignore (pass|drop|tx)\n");
-    fprintf(stderr, "             map <fromprefix> <toprefix>\n");
+    fprintf(stderr, "           | mac <gatewaymac>\n");
+    fprintf(stderr, "           | success (pass|drop|tx)\n");
+    fprintf(stderr, "           | ignore (pass|drop|tx)\n");
+    fprintf(stderr, "           | map <fromprefix> <toprefix>\n");
+    fprintf(stderr, "           | dynamic <v4prefix>\n");
 }
 
 
@@ -237,6 +258,11 @@ static bool parse_prefix(const char *st, struct sockaddr_storage *addr) {
 
     free(network);
     return false;
+}
+
+
+static bool add_dynamic(int fd, uint32_t ipv4) {
+    return bpf_map_update_elem(fd, NULL, &ipv4, BPF_ANY) == 0;
 }
 
 
@@ -303,8 +329,8 @@ int main(int argc, const char *argv[]) {
     }
 
     /* Get references to all the interesting maps */
-    struct bpf_map *datamap = bpf_object__find_map_by_name(prog, ".data");
-    if (!datamap) {
+    struct bpf_map *configmap = bpf_object__find_map_by_name(prog, "nat64_configmap");
+    if (!configmap) {
         fprintf(stderr, "Failed to find config map\n");
         return false;
     }
@@ -327,12 +353,20 @@ int main(int argc, const char *argv[]) {
         return false;
     }
 
+    struct bpf_map *nat64_dyn4 = bpf_object__find_map_by_name(prog, "nat64_dyn4");
+    if (!nat64_dyn4) {
+        fprintf(stderr, "Couldn't find nat64_dyn4 map\n");
+        return false;
+    }
+
+
     int configmap_fd = -1;
     int counters_fd = -1;
     int nat64_6to4_fd = -1;
     int nat64_4to6_fd = -1;
+    int nat64_dyn4_fd = -1;
 
-    if ((configmap_fd = bpf_map__fd(datamap)) == -1) {
+    if ((configmap_fd = bpf_map__fd(configmap)) == -1) {
         fprintf(stderr, "Failed to get configmap fd\n");
         return 1;
     }
@@ -352,18 +386,23 @@ int main(int argc, const char *argv[]) {
         return 1;
     }
 
-    configmap_t configmap = { .version = 0 };
+    if ((nat64_4to6_fd = bpf_map__fd(nat64_dyn4)) == -1) {
+        fprintf(stderr, "Failed to get nat64_dyn4 fd\n");
+        return 1;
+    }
+
+    configmap_t config = { .version = 0 };
     int zero = 0;
-    err = bpf_map_lookup_elem(configmap_fd, &zero, &configmap);
+    err = bpf_map_lookup_elem(configmap_fd, &zero, &config);
     if (err != 0) {
         libbpf_strerror(err, errmsg, sizeof(errmsg));
         fprintf(stderr, "Failed to read configmap, loading defaults: %s\n", errmsg);
     }
 
     /* Default config.  TODO: Read from running program */
-    if (configmap.version == 0 || configmap.dst_mac_mode == 0) {
+    if (config.version == 0 || config.dst_mac_mode == 0) {
         /* No config, load defaults. */
-        configmap = (configmap_t) {
+        config = (configmap_t) {
             .version = VERSION,
             .success_action = XDP_TX,
             .ignore_action = XDP_DROP,
@@ -371,12 +410,12 @@ int main(int argc, const char *argv[]) {
             .magic_mac = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x64 },
         };
 
-        if (!get_mac_address(ifname, configmap.gateway_mac)) {
+        if (!get_mac_address(ifname, config.gateway_mac)) {
             fprintf(stderr, "Failed to get mac address\n");
             return false;
         }
-    } else if (configmap.version != VERSION) {
-        fprintf(stderr, "Wrong version of ebpf program loaded, expected %d, got %d\n", VERSION, configmap.version);
+    } else if (config.version != VERSION) {
+        fprintf(stderr, "Wrong version of ebpf program loaded, expected %d, got %d\n", VERSION, config.version);
         return 1;
     }
 
@@ -389,9 +428,9 @@ int main(int argc, const char *argv[]) {
                 return 1;
             }
             if (strcmp(gw, "reflect") == 0) {
-                configmap.dst_mac_mode = DST_MAC_REFLECT;
-            } else if (parse_mac(gw, configmap.gateway_mac)) {
-                configmap.dst_mac_mode = DST_MAC_GW;
+                config.dst_mac_mode = DST_MAC_REFLECT;
+            } else if (parse_mac(gw, config.gateway_mac)) {
+                config.dst_mac_mode = DST_MAC_GW;
             } else {
                 fprintf(stderr, "Failed to parse gateway address\n");
                 usage(argv[0]);
@@ -403,7 +442,7 @@ int main(int argc, const char *argv[]) {
                 fprintf(stderr, "expected mac address after 'mac'\n");
                 usage(argv[0]);
                 return 1;
-            } else if (parse_mac(mac, configmap.magic_mac)) {
+            } else if (parse_mac(mac, config.magic_mac)) {
                 /* Success */
             } else {
                 fprintf(stderr, "Failed to parse mac address\n");
@@ -411,13 +450,13 @@ int main(int argc, const char *argv[]) {
                 return 1;
             }
         } else if (strcmp(arg, "success") == 0) {
-            if (!parse_action(pop_arg(argc, argv, &idx), &configmap.success_action)) {
+            if (!parse_action(pop_arg(argc, argv, &idx), &config.success_action)) {
                 fprintf(stderr, "Failed to parse success action\n");
                 usage(argv[1]);
                 return 1;
             }
         } else if (strcmp(arg, "ignore") == 0) {
-            if (!parse_action(pop_arg(argc, argv, &idx), &configmap.ignore_action)) {
+            if (!parse_action(pop_arg(argc, argv, &idx), &config.ignore_action)) {
                 fprintf(stderr, "Failed to parse ignore action\n");
                 usage(argv[1]);
                 return 1;
@@ -493,6 +532,38 @@ int main(int argc, const char *argv[]) {
                 usage(argv[0]);
                 return 1;
             }
+        } else if (strcmp(arg, "dynamic") == 0) {
+            const char *prefix = pop_arg(argc, argv, &idx);
+            if (!prefix) {
+                fprintf(stderr, "dynamic needs an ipv4 prefix argument\n");
+                usage(argv[0]);
+                return 1;
+            }
+            struct sockaddr_storage parsed_prefix;
+            if (!parse_prefix(prefix, &parsed_prefix) && parsed_prefix.ss_family != AF_INET) {
+                fprintf(stderr, "Failed to parse dynamic ipv4 prefix: %s\n", prefix);
+                usage(argv[0]);
+                return 1;
+            }
+            struct sockaddr_in *ipv4_prefix = (struct sockaddr_in *)&parsed_prefix;
+            if (ipv4_prefix->sin_port > 32) {
+                fprintf(stderr, "dynamic prefix length incorrect: %s\n", prefix);
+                usage(argv[0]);
+                return 1;
+            }
+            switch(ipv4_prefix->sin_port) {
+                case 32:
+                case 31:
+                    for(size_t i = 0; i <= (32U - ipv4_prefix->sin_port); ++i) {
+                        add_dynamic(nat64_dyn4_fd, htons(ntohs(ipv4_prefix->sin_addr.s_addr) + i));
+                    }
+                    break;
+                default:
+                    /* Do not include the network and broadcast address */
+                    for(size_t i = 1; i < (32 - (unsigned)ipv4_prefix->sin_port); ++i)
+                        add_dynamic(nat64_dyn4_fd, htons(ntohs(ipv4_prefix->sin_addr.s_addr) + i));
+                    break;
+            }
         } else {
             fprintf(stderr, "Unexpected config option %s\n", arg);
             usage(argv[0]);
@@ -503,7 +574,7 @@ int main(int argc, const char *argv[]) {
     };
 
     /* apply the config map */
-    if ((bpf_map_update_elem(configmap_fd, &zero, &configmap, 0)) != 0) {
+    if ((bpf_map_update_elem(configmap_fd, &zero, &config, 0)) != 0) {
         fprintf(stderr,
                 "ERR: Failed to update configmap: %s\n", strerror(errno));
         return false;
