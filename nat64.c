@@ -54,7 +54,7 @@
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define __noinline __attribute__((noinline))
 
-#if 0
+#if 1
 #define __maybeinline __always_inline
 #else
 // For when debugging stack allocations
@@ -145,9 +145,7 @@ typedef struct nat64_ctx_t {
 } nat64_ctx_t;
 
 
-#define DISABLE_LAYER3
-
-static __maybeinline void increment_counter_by(counter_t counter, uint64_t value) {
+static __always_inline void increment_counter_by(counter_t counter, uint64_t value) {
     uint32_t key = counter;
     uint64_t *counter_value = bpf_map_lookup_elem(&nat64_counters, &key);
     if (counter_value) {
@@ -156,11 +154,11 @@ static __maybeinline void increment_counter_by(counter_t counter, uint64_t value
 }
 
 
-static __maybeinline void increment_counter(counter_t counter) {
+static __always_inline void increment_counter(counter_t counter) {
     increment_counter_by(counter, 1);
 }
 
-static __maybeinline status_t err_to_status(int err) {
+static __always_inline status_t err_to_status(int err) {
     if (err < 0) {
         return STATUS_INVALID;
     }
@@ -168,12 +166,12 @@ static __maybeinline status_t err_to_status(int err) {
 }
 
 
-static __maybeinline uint16_t u8_combine(uint8_t hi, uint8_t lo) {
+static __always_inline uint16_t u8_combine(uint8_t hi, uint8_t lo) {
     return ((uint16_t)hi << 8) | lo;
 }
 
 
-static __maybeinline uint32_t partial_netsum(__arg_nonnull void *data, size_t len) {
+static __always_inline uint32_t partial_netsum(__arg_nonnull void *data, size_t len) {
     uint32_t netsum = 0;
     uint8_t *data8 = data;
 
@@ -185,19 +183,25 @@ static __maybeinline uint32_t partial_netsum(__arg_nonnull void *data, size_t le
 }
 
 
-static __maybeinline uint16_t finalise_netsum(uint32_t netsum) {
+static __always_inline uint16_t finalise_netsum(uint32_t netsum) {
     netsum = (netsum >> 16) + (netsum & 0xFFFF);
     netsum = (netsum >> 16) + (netsum & 0xFFFF);
     return htons((uint16_t)~netsum);
 }
 
 
-static __maybeinline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
+static __noinline size_t packet_len(__arg_ctx struct xdp_md *ctx) {
+    /* This is noinline, because otherwise the compiler reorders things
+     * associatively, and then the verifier thinks that ctx->data_end +
+     * something in a register is a pointer, and an illegal pointer at that and
+     * complains.  We solve this by forcing this out of line and letting the
+     * jit inline it later.
+     */
     return ctx->data_end - ctx->data;
 }
 
 
-static __maybeinline void *get_header_at(__arg_ctx struct xdp_md *ctx, size_t offset, size_t hdr_size) {
+static __always_inline void *get_header_at(__arg_ctx struct xdp_md *ctx, size_t offset, size_t hdr_size) {
     if (UNLIKELY(ctx->data + offset + hdr_size > ctx->data_end)) {
         increment_counter(COUNTER_TRUNCATED);
         LOG("Wanted header of %d bytes, only %d remaining",
@@ -214,7 +218,7 @@ static __always_inline void *get_header(__arg_ctx struct xdp_md *ctx, size_t hdr
 }
 
 
-static __maybeinline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t hdr_size, __arg_nullable uint32_t *old_parent_netsum) {
+static __always_inline status_t pop_header(__arg_ctx struct xdp_md *ctx, size_t hdr_size, __arg_nullable uint32_t *old_parent_netsum) {
     if (old_parent_netsum) {
         if (LIKELY(ctx->data + hdr_size <= ctx->data_end)) {
             *old_parent_netsum += partial_netsum((void *)(unsigned long)ctx->data, hdr_size);
@@ -272,7 +276,7 @@ static __always_inline status_t replace_header(__arg_ctx struct xdp_md *ctx,
 }
 
 
-static __maybeinline uint32_t pseudo_netsum_from_ipv4(__arg_nonnull const struct ip *ip) {
+static __always_inline uint32_t pseudo_netsum_from_ipv4(__arg_nonnull const struct ip *ip) {
     uint32_t netsum = 0;
     netsum += ntohs(ip->ip_src.s_addr >> 16);
     netsum += ntohs(ip->ip_src.s_addr & 0xFFFF);
@@ -285,7 +289,7 @@ static __maybeinline uint32_t pseudo_netsum_from_ipv4(__arg_nonnull const struct
 }
 
 
-static __maybeinline uint32_t pseudo_netsum_from_ipv6(__arg_nonnull const struct ip6_hdr *ip6) {
+static __always_inline uint32_t pseudo_netsum_from_ipv6(__arg_nonnull const struct ip6_hdr *ip6) {
     uint32_t netsum = 0;
     for (size_t i = 0; i < 8; ++i) {
         netsum += ntohs(ip6->ip6_src.s6_addr16[i]);
@@ -367,7 +371,7 @@ static void dyn6to4_expire(void *unused_map, struct in6_addr *key, dyn6to4_value
 }
 
 
-static __maybeinline status_t allocate_v4(const struct in6_addr *v6, struct in_addr *v4, uint64_t expiry_ns) {
+static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in_addr *v4, uint64_t expiry_ns) {
     if (bpf_map_pop_elem(&nat64_dyn4, v4) != 0) {
         LOG("Out of addresses!\n");
         // TODO: Increment counter
@@ -416,7 +420,7 @@ static __maybeinline status_t allocate_v4(const struct in6_addr *v6, struct in_a
 }
 
 
-static __maybeinline status_t remap_v4_to_v6(struct in_addr addr, struct in6_addr *out) {
+static __always_inline status_t remap_v4_to_v6(struct in_addr addr, struct in6_addr *out) {
     /* There should always be a default prefix in the map, but to keep the
      * verifier happy we have a fallback as an obviously invalid address that
      * also includes the v4 address to make debugging easier.
@@ -432,10 +436,12 @@ static __maybeinline status_t remap_v4_to_v6(struct in_addr addr, struct in6_add
         if (v6_prefix->len <= 96) {
             out->s6_addr32[3] = addr.s_addr;
         }
+        LOG("Remapped %08x by v6embed", ntohl(addr.s_addr));
         return STATUS_SUCCESS;
     }
 
     if ((out = bpf_map_lookup_elem(&nat64_dyn4to6, &addr)) != NULL) {
+        LOG("Remapped %08x by dynamic", ntohl(addr.s_addr));
         return STATUS_SUCCESS;
     }
 
@@ -444,7 +450,7 @@ static __maybeinline status_t remap_v4_to_v6(struct in_addr addr, struct in6_add
 }
 
 
-static __maybeinline status_t remap_v6_to_v4(struct in6_addr addr, struct in_addr *out) {
+static __always_inline status_t remap_v6_to_v4(struct in6_addr addr, struct in_addr *out) {
     ipv4_prefix *v4;
     ipv6_prefix v6 = {
         .len = 128,
@@ -455,6 +461,8 @@ static __maybeinline status_t remap_v6_to_v4(struct in6_addr addr, struct in_add
         out->s_addr = htonl(
                 (ntohl(v4->prefix.s_addr) & mask)
                 | (ntohl(addr.s6_addr32[3]) & ~mask));
+        LOG("Remapped to %08x by v6 extraction",
+                ntohl(out->s_addr));
         return STATUS_SUCCESS;
     }
 
@@ -466,7 +474,7 @@ static __maybeinline status_t remap_v6_to_v4(struct in6_addr addr, struct in_add
 }
 
 
-static __maybeinline status_t construct_v4_from_v6(__arg_nonnull const struct ip6_hdr *ip6, struct ip *out) {
+static __always_inline status_t construct_v4_from_v6(__arg_nonnull const struct ip6_hdr *ip6, struct ip *out) {
     out->ip_v = 0x4;
     out->ip_hl = 20/4;
     out->ip_tos = (ntohl(ip6->ip6_flow) >> 20) & 0xFF;
@@ -484,7 +492,7 @@ static __maybeinline status_t construct_v4_from_v6(__arg_nonnull const struct ip
 }
 
 
-static __maybeinline status_t construct_v6_from_v4(struct ip *iphdr, struct ip6_hdr *out) {
+static __always_inline status_t construct_v6_from_v4(struct ip *iphdr, struct ip6_hdr *out) {
     out->ip6_flow = htonl(6 << 28 | iphdr->ip_tos << 20);
     out->ip6_plen = htons(ntohs(iphdr->ip_len) - iphdr->ip_hl * 4);
     out->ip6_hlim = iphdr->ip_ttl;
@@ -759,7 +767,7 @@ static __maybeinline status_t process_icmp4(nat64_ctx_t *ctx, uint32_t old_netsu
     /* The packet length can change when we replace the IP header,
      * so remove the old packet length from the checksum here.
      */
-    old_netsum += packet_len(ctx->xdp) + sizeof(struct icmphdr);
+    old_netsum += sizeof(struct icmphdr) + packet_len(ctx->xdp);
 
     /* Also remove the old type and code, because it's going to be remapped */
     old_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
@@ -1023,7 +1031,7 @@ static __maybeinline status_t process_ipv6(nat64_ctx_t *ctx) {
 
 // Ethernet | IPv4... => Ethernet | IPv6...
 // Ethernet | IPv6... => Ethernet | IPv4...
-static __maybeinline status_t process_ethernet(nat64_ctx_t *ctx) {
+static __always_inline status_t process_ethernet(nat64_ctx_t *ctx) {
     struct ether_header *ethhdr = NULL;
 
     RETURN_IF_NULL(ethhdr = get_header(ctx->xdp, sizeof(struct ether_header)));
@@ -1068,7 +1076,6 @@ static __maybeinline status_t process_ethernet(nat64_ctx_t *ctx) {
         LOG("Done with status %d", ret);
         return ret;
     } else {
-        //LOG("Packet not to magic ethernet address, ignoring.");
         increment_counter(COUNTER_WRONG_MAC);
         return STATUS_IGNORE;
     }
