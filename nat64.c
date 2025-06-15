@@ -61,13 +61,8 @@
 #define __maybeinline __noinline
 #endif
 
-#if 1
 #define LOG(msg, ...) { static const char fmt[] = (msg); bpf_trace_printk(fmt, sizeof(fmt), ##__VA_ARGS__); }
 #define LOG_IF(cond, msg, ...) do { if (UNLIKELY(cond)) LOG(msg, ##__VA_ARGS__); } while(0)
-#else
-#define LOG(msg, ...)
-#define LOG_IF(cond, msg, ...) do { (cond); } while(0)
-#endif
 
 #define MAX(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a > maxtmp_b ? maxtmp_a : maxtmp_b; })
 #define MIN(a,b) ({ typeof(a) maxtmp_a = (a); typeof(b) maxtmp_b = (b); maxtmp_a < maxtmp_b ? maxtmp_a : maxtmp_b; })
@@ -108,32 +103,6 @@ struct {
     __uint(max_entries, 20);
 } nat64_6to4 SEC(".maps");
 
-
-typedef struct scratch_t {
-    union {
-        struct ip6_hdr ip6;
-        struct ip ip4;
-    } outer;
-    union {
-        struct icmphdr icmp4;
-        struct icmp6_hdr icmp6;
-    } transport;
-    union {
-        struct ip6_hdr ip6;
-        struct ip ip4;
-    } inner;
-} scratch_t;
-
-
-struct nat64_scratch {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, uint32_t);
-    __type(value, scratch_t);
-    __uint(pinning, LIBBPF_PIN_NONE);
-    __uint(map_flags, BPF_F_RDONLY);
-} nat64_scratch SEC(".maps");
-
 struct nat64_configmap {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, uint32_t);
@@ -172,7 +141,6 @@ struct {
 
 typedef struct nat64_ctx_t {
     struct xdp_md *xdp;
-    scratch_t *scratch;
     configmap_t *config;
 } nat64_ctx_t;
 
@@ -680,12 +648,13 @@ static __maybeinline status_t process_quoted_ipv4(nat64_ctx_t *ctx,
 
     uint8_t protocol = iphdr->ip_p;
 
-    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ctx->scratch->inner.ip6));
+    struct ip6_hdr ip6;
+    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ip6));
 
     /* TODO: Handle fragmented IPv4 packet */
 
     uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
-    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ctx->scratch->inner.ip6);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6);
 
     if (UNLIKELY(iphdr->ip_v != 0x04)) {
         LOG("not ipv4: %d", iphdr->ip_v);
@@ -696,7 +665,7 @@ static __maybeinline status_t process_quoted_ipv4(nat64_ctx_t *ctx,
     /* Due to limits on minimum packet sizes imposed by the kernel, we cannot
      * do the usual pop / push for this, but instead need to do it all in place.
      */
-    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip), old_parent_netsum, &ctx->scratch->inner.ip6, sizeof(struct ip6_hdr), new_parent_netsum));
+    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip), old_parent_netsum, &ip6, sizeof(struct ip6_hdr), new_parent_netsum));
     size_t offset = sizeof(struct ip6_hdr);
 
     /* Handle any inner protocols that need handling */
@@ -736,14 +705,15 @@ static __maybeinline status_t process_quoted_ipv6(nat64_ctx_t *ctx,
 
     uint8_t protocol = ip6->ip6_nxt;
 
-    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ctx->scratch->inner.ip4));
+    struct ip ip4;
+    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ip4));
 
     uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
-    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ctx->scratch->inner.ip4);
+    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip4);
 
     /* TODO: Handle fragmented IPv4 packet */
 
-    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip6_hdr), old_parent_netsum, &ctx->scratch->inner.ip4, sizeof(struct iphdr), new_parent_netsum));
+    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip6_hdr), old_parent_netsum, &ip4, sizeof(struct iphdr), new_parent_netsum));
     size_t offset = sizeof(struct iphdr);
 
     /* Handle any inner protocols that need handling */
@@ -769,7 +739,7 @@ static __maybeinline status_t process_quoted_ipv6(nat64_ctx_t *ctx,
     }
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->inner.ip4, sizeof(struct iphdr), new_parent_netsum));
+    RETURN_IF_ERR(push_header(ctx->xdp, &ip4, sizeof(struct iphdr), new_parent_netsum));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -781,7 +751,8 @@ static __maybeinline status_t process_icmp4(nat64_ctx_t *ctx, uint32_t old_netsu
     struct icmphdr *icmp = NULL;
     RETURN_IF_NULL((icmp = get_header(ctx->xdp, sizeof(struct icmphdr))));
 
-    memcpy(&ctx->scratch->transport.icmp6, icmp, sizeof(struct icmp6_hdr));
+    struct icmp6_hdr icmp6;
+    memcpy(&icmp6, icmp, sizeof(struct icmp6_hdr));
 
     RETURN_IF_ERR(pop_header(ctx->xdp, sizeof(struct icmphdr), NULL));
 
@@ -791,38 +762,38 @@ static __maybeinline status_t process_icmp4(nat64_ctx_t *ctx, uint32_t old_netsu
     old_netsum += packet_len(ctx->xdp) + sizeof(struct icmphdr);
 
     /* Also remove the old type and code, because it's going to be remapped */
-    old_netsum += u8_combine(ctx->scratch->transport.icmp6.icmp6_type, ctx->scratch->transport.icmp6.icmp6_code);
+    old_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
     status_t ret = STATUS_INVALID;
 
-    switch (ctx->scratch->transport.icmp6.icmp6_type) {
+    switch (icmp6.icmp6_type) {
         case ICMP_ECHOREPLY:
-            ctx->scratch->transport.icmp6.icmp6_type = ICMP6_ECHO_REPLY;
+            icmp6.icmp6_type = ICMP6_ECHO_REPLY;
             ret = STATUS_SUCCESS;
             break;
         case ICMP_DEST_UNREACH:
-            ctx->scratch->transport.icmp6.icmp6_type = ICMP6_DST_UNREACH;
-            switch (ctx->scratch->transport.icmp6.icmp6_code) {
-                case ICMP_NET_UNREACH: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_HOST_UNREACH: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+            icmp6.icmp6_type = ICMP6_DST_UNREACH;
+            switch (icmp6.icmp6_code) {
+                case ICMP_NET_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
                 case ICMP_PROT_UNREACH: LOG("Not Implemented"); /* TODO */ break;
-                case ICMP_PORT_UNREACH: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOPORT; break;
+                case ICMP_PORT_UNREACH: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOPORT; break;
                 case ICMP_FRAG_NEEDED:
-                          ctx->scratch->transport.icmp6.icmp6_code = ICMP6_PACKET_TOO_BIG;
-                          ctx->scratch->transport.icmp6.icmp6_type = 0;
-                          ctx->scratch->transport.icmp6.icmp6_mtu = htonl(ctx->scratch->transport.icmp6.icmp6_mtu != 0
-                                  ? ctx->scratch->transport.icmp6.icmp6_mtu - sizeof(struct ip)
+                          icmp6.icmp6_code = ICMP6_PACKET_TOO_BIG;
+                          icmp6.icmp6_type = 0;
+                          icmp6.icmp6_mtu = htonl(icmp6.icmp6_mtu != 0
+                                  ? icmp6.icmp6_mtu - sizeof(struct ip)
                                   : 1280);
                           break;
-                case ICMP_SR_FAILED: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_NET_UNKNOWN: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_HOST_UNKNOWN: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_HOST_ISOLATED: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_NET_ANO: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
-                case ICMP_HOST_ANO: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
-                case ICMP_NET_UNR_TOS: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_HOST_UNR_TOS: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
-                case ICMP_PKT_FILTERED: ctx->scratch->transport.icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_SR_FAILED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_NET_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNKNOWN: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_ISOLATED: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_NET_ANO: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_HOST_ANO: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
+                case ICMP_NET_UNR_TOS: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_HOST_UNR_TOS: icmp6.icmp6_code = ICMP6_DST_UNREACH_NOROUTE; break;
+                case ICMP_PKT_FILTERED: icmp6.icmp6_code = ICMP6_DST_UNREACH_ADMIN; break;
                 case ICMP_PREC_VIOLATION: return STATUS_DROP; break;
                 default:
                   return STATUS_DROP;
@@ -830,11 +801,11 @@ static __maybeinline status_t process_icmp4(nat64_ctx_t *ctx, uint32_t old_netsu
             ret = process_quoted_ipv4(ctx, &old_netsum, &new_netsum);
             break;
         case ICMP_TIME_EXCEEDED:
-            ctx->scratch->transport.icmp6.icmp6_type = ICMP6_TIME_EXCEEDED;
+            icmp6.icmp6_type = ICMP6_TIME_EXCEEDED;
             ret = process_quoted_ipv4(ctx, &old_netsum, &new_netsum);
             break;
         case ICMP_ECHO:
-            ctx->scratch->transport.icmp6.icmp6_type = ICMP6_ECHO_REQUEST;
+            icmp6.icmp6_type = ICMP6_ECHO_REQUEST;
             ret = STATUS_SUCCESS;
             break;
         /* Single hop messages, not routed */
@@ -849,29 +820,29 @@ static __maybeinline status_t process_icmp4(nat64_ctx_t *ctx, uint32_t old_netsu
         case ICMP_INFO_REPLY:
         case ICMP_ADDRESS:
         case ICMP_ADDRESSREPLY:
-            LOG("Obsolete icmp v4 type %d dropped", ctx->scratch->transport.icmp6.icmp6_type);
+            LOG("Obsolete icmp v4 type %d dropped", icmp6.icmp6_type);
             increment_counter(COUNTER_OBSOLETE_ICMP);
             return STATUS_DROP;
         default: /* Unknown */
-            LOG("Unknown icmp v4 type %d dropped", ctx->scratch->transport.icmp6.icmp6_type);
+            LOG("Unknown icmp v4 type %d dropped", icmp6.icmp6_type);
             increment_counter(COUNTER_UNKNOWN_ICMPV4);
             return STATUS_DROP;
     }
 
     /* ... Add back the packet length to the checksum */
     new_netsum += packet_len(ctx->xdp) + sizeof(struct icmp6_hdr);
-    new_netsum += u8_combine(ctx->scratch->transport.icmp6.icmp6_type, ctx->scratch->transport.icmp6.icmp6_code);
+    new_netsum += u8_combine(icmp6.icmp6_type, icmp6.icmp6_code);
 
     /* Modifying the checksum between pop and push header is okay here, because
      * there's no parent to be modified twice */
     apply_checksum_fixup(
-            &ctx->scratch->transport.icmp6.icmp6_cksum,
+            &icmp6.icmp6_cksum,
             old_netsum,
             new_netsum,
             NULL,
             NULL);
 
-    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->transport.icmp6, sizeof(struct icmp6_hdr), NULL));
+    RETURN_IF_ERR(push_header(ctx->xdp, &icmp6, sizeof(struct icmp6_hdr), NULL));
 
     return ret;
 }
@@ -882,7 +853,8 @@ static __maybeinline status_t process_icmp6(nat64_ctx_t *ctx, uint32_t old_netsu
     struct icmp6_hdr *icmp6 = NULL;
     RETURN_IF_NULL((icmp6 = get_header(ctx->xdp, sizeof(struct icmp6_hdr))));
 
-    memcpy(&ctx->scratch->transport.icmp4, icmp6, sizeof(struct icmphdr));
+    struct icmphdr icmp4;
+    memcpy(&icmp4, icmp6, sizeof(struct icmphdr));
 
     old_netsum += u8_combine(icmp6->icmp6_type, icmp6->icmp6_code);
 
@@ -890,34 +862,34 @@ static __maybeinline status_t process_icmp6(nat64_ctx_t *ctx, uint32_t old_netsu
 
     status_t ret = STATUS_DROP;
 
-    switch (ctx->scratch->transport.icmp4.type) {
+    switch (icmp4.type) {
         case ICMP6_DST_UNREACH:
-            ctx->scratch->transport.icmp4.type = ICMP_DEST_UNREACH;
-            switch (ctx->scratch->transport.icmp4.code) {
-                case ICMP6_DST_UNREACH_NOROUTE: ctx->scratch->transport.icmp4.code = ICMP_NET_UNREACH; break;
-                case ICMP6_DST_UNREACH_ADMIN: ctx->scratch->transport.icmp4.code = ICMP_HOST_ANO; break;
-                case ICMP6_DST_UNREACH_BEYONDSCOPE: ctx->scratch->transport.icmp4.code = ICMP_HOST_UNREACH ; break;
-                case ICMP6_DST_UNREACH_ADDR: ctx->scratch->transport.icmp4.code = ICMP_HOST_UNKNOWN; break;
-                case ICMP6_DST_UNREACH_NOPORT: ctx->scratch->transport.icmp4.code = ICMP_PORT_UNREACH; break;
+            icmp4.type = ICMP_DEST_UNREACH;
+            switch (icmp4.code) {
+                case ICMP6_DST_UNREACH_NOROUTE: icmp4.code = ICMP_NET_UNREACH; break;
+                case ICMP6_DST_UNREACH_ADMIN: icmp4.code = ICMP_HOST_ANO; break;
+                case ICMP6_DST_UNREACH_BEYONDSCOPE: icmp4.code = ICMP_HOST_UNREACH ; break;
+                case ICMP6_DST_UNREACH_ADDR: icmp4.code = ICMP_HOST_UNKNOWN; break;
+                case ICMP6_DST_UNREACH_NOPORT: icmp4.code = ICMP_PORT_UNREACH; break;
                 default:
-                  LOG("Unknown ICMPv6 Destination Unreachable %d", ctx->scratch->transport.icmp4.code);
+                  LOG("Unknown ICMPv6 Destination Unreachable %d", icmp4.code);
                   return STATUS_DROP;
             }
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
             break;
         case ICMP6_PACKET_TOO_BIG:
-            ctx->scratch->transport.icmp4.type = ICMP_DEST_UNREACH;
-            ctx->scratch->transport.icmp4.code = ICMP_FRAG_NEEDED;
-            ctx->scratch->transport.icmp4.un.frag.mtu -= 20;
+            icmp4.type = ICMP_DEST_UNREACH;
+            icmp4.code = ICMP_FRAG_NEEDED;
+            icmp4.un.frag.mtu -= 20;
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
             break;
         case ICMP6_TIME_EXCEEDED:
-            ctx->scratch->transport.icmp4.type = ICMP_TIME_EXCEEDED;
+            icmp4.type = ICMP_TIME_EXCEEDED;
             ret = process_quoted_ipv6(ctx, &old_netsum, &new_netsum);
             break;
         case ICMP6_PARAM_PROB: /* TODO */ break;
         case ICMP6_ECHO_REPLY:
-            ctx->scratch->transport.icmp4.type = ICMP_ECHO;
+            icmp4.type = ICMP_ECHO;
             ret = STATUS_SUCCESS;
             break;
         case ICMP6_ECHO_REQUEST:
@@ -927,16 +899,16 @@ static __maybeinline status_t process_icmp6(nat64_ctx_t *ctx, uint32_t old_netsu
         /* Single hop messages, not routed */
         /* Obsolete messages */
         default: /* Unknown */
-            LOG("Unknown icmp v6 type %d", ctx->scratch->transport.icmp4.type);
+            LOG("Unknown icmp v6 type %d", icmp4.type);
             increment_counter(COUNTER_UNKNOWN_ICMPV6);
             break;
     }
 
-    new_netsum += u8_combine(ctx->scratch->transport.icmp4.type, ctx->scratch->transport.icmp4.code);
+    new_netsum += u8_combine(icmp4.type, icmp4.code);
 
-    apply_checksum_fixup(&ctx->scratch->transport.icmp4.checksum, old_netsum, new_netsum, NULL, NULL);
+    apply_checksum_fixup(&icmp4.checksum, old_netsum, new_netsum, NULL, NULL);
 
-    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->transport.icmp4, sizeof(struct icmphdr), NULL));
+    RETURN_IF_ERR(push_header(ctx->xdp, &icmp4, sizeof(struct icmphdr), NULL));
 
     return ret;
 }
@@ -950,12 +922,13 @@ static __maybeinline status_t process_ipv4(nat64_ctx_t *ctx) {
 
     uint8_t protocol = iphdr->ip_p;
 
-    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ctx->scratch->outer.ip6));
+    struct ip6_hdr ip6;
+    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ip6));
 
     /* TODO: Handle fragmented IPv4 packet */
 
     uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
-    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ctx->scratch->outer.ip6);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6);
 
     /* Strip off the old IPv4 header */
     RETURN_IF_ERR(pop_header(ctx->xdp, sizeof(struct ip), NULL));
@@ -983,10 +956,10 @@ static __maybeinline status_t process_ipv4(nat64_ctx_t *ctx) {
             LOG("Unknown IPv4 protocol %d", protocol);
     }
 
-    ctx->scratch->outer.ip6.ip6_plen = htons(packet_len(ctx->xdp));
+    ip6.ip6_plen = htons(packet_len(ctx->xdp));
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->outer.ip6, sizeof(struct ip6_hdr), NULL));
+    RETURN_IF_ERR(push_header(ctx->xdp, &ip6, sizeof(struct ip6_hdr), NULL));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -1001,10 +974,11 @@ static __maybeinline status_t process_ipv6(nat64_ctx_t *ctx) {
 
     uint8_t protocol = ip6->ip6_nxt;
 
-    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ctx->scratch->outer.ip4));
+    struct ip ip4;
+    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ip4));
 
     uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
-    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ctx->scratch->outer.ip4);
+    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip4);
 
     /* TODO: Handle fragmented IPv4 packet */
 
@@ -1034,13 +1008,13 @@ static __maybeinline status_t process_ipv6(nat64_ctx_t *ctx) {
             LOG("Unknown IP Protocol %d", protocol);
     }
 
-    uint16_t old = ntohs(ctx->scratch->outer.ip4.ip_len);
+    uint16_t old = ntohs(ip4.ip_len);
     /* Fixup packet length */
-    ctx->scratch->outer.ip4.ip_len = htons(packet_len(ctx->xdp) + sizeof(struct iphdr));
-    apply_checksum_fixup(&ctx->scratch->outer.ip4.ip_sum, old, ntohs(ctx->scratch->outer.ip4.ip_len), NULL, NULL);
+    ip4.ip_len = htons(packet_len(ctx->xdp) + sizeof(struct iphdr));
+    apply_checksum_fixup(&ip4.ip_sum, old, ntohs(ip4.ip_len), NULL, NULL);
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->outer.ip4, sizeof(struct iphdr), NULL));
+    RETURN_IF_ERR(push_header(ctx->xdp, &ip4, sizeof(struct iphdr), NULL));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -1107,12 +1081,8 @@ int xdp_nat64(__arg_ctx struct xdp_md *xdp) {
     uint32_t key = 0;
     nat64_ctx_t nat64_ctx = {
         .xdp = xdp,
-        .scratch =bpf_map_lookup_elem(&nat64_scratch, &key),
-        .config =bpf_map_lookup_elem(&nat64_configmap, &key),
+        .config = bpf_map_lookup_elem(&nat64_configmap, &key),
     };
-
-    if (nat64_ctx.scratch == NULL)
-        return XDP_DROP;
 
     if (nat64_ctx.config == NULL)
         return XDP_DROP;
