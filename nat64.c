@@ -116,7 +116,7 @@ typedef struct dyn6to4_value_t {
     uint64_t expiry;
 } dyn6to4_value_t;
 
-enum { MAX_DYNAMIC_ADDRS = 1 << 20 };
+enum { MAX_DYNAMIC_ADDRS = 20 };
 
 struct nat64_dyn6to4 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -138,9 +138,34 @@ struct {
     __uint(max_entries, MAX_DYNAMIC_ADDRS);
 } nat64_dyn4 SEC(".maps");
 
+typedef struct scratch_t {
+    union {
+        struct ip ip4;
+        struct ip6_hdr ip6;
+    } outer;
+    union {
+        struct icmphdr icmp4;
+        struct icmp6_hdr icmp6;
+    } transport;
+    union {
+        struct ip ip4;
+        struct ip6_hdr ip6;
+    } inner;
+} scratch_t;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, uint32_t);
+    __type(value, struct scratch_t);
+    __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_NONE);
+    __uint(map_flags, BPF_F_RDONLY);
+} nat64_scratch SEC(".maps");
+
 
 typedef struct nat64_ctx_t {
     struct xdp_md *xdp;
+    scratch_t *scratch;
     configmap_t *config;
 } nat64_ctx_t;
 
@@ -157,6 +182,7 @@ static __always_inline void increment_counter_by(counter_t counter, uint64_t val
 static __always_inline void increment_counter(counter_t counter) {
     increment_counter_by(counter, 1);
 }
+
 
 static __always_inline status_t err_to_status(int err) {
     if (err < 0) {
@@ -347,7 +373,7 @@ static __always_inline void apply_checksum_fixup(__arg_nonnull uint16_t *checksu
 }
 
 
-static void dyn6to4_expire(void *unused_map, struct in6_addr *key, dyn6to4_value_t *value) {
+static int dyn6to4_expire(void *unused_map, struct in6_addr *key, dyn6to4_value_t *value) {
     (void)unused_map;
     uint64_t now = bpf_ktime_get_ns();
     if (value->expiry <= now) {
@@ -368,12 +394,14 @@ static void dyn6to4_expire(void *unused_map, struct in6_addr *key, dyn6to4_value
             LOG("Re-upping timer failed");
         }
     }
+    return 0;
 }
 
 
 static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in_addr *v4, uint64_t expiry_ns) {
-    if (bpf_map_pop_elem(&nat64_dyn4, v4) != 0) {
-        LOG("Out of addresses!\n");
+    int err;
+    if ((err = bpf_map_pop_elem(&nat64_dyn4, v4)) != 0) {
+        LOG("Out of addresses! (%d)\n", err);
         // TODO: Increment counter
         return STATUS_FAILED;
     }
@@ -383,8 +411,8 @@ static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in
         .expiry = bpf_ktime_get_coarse_ns() + expiry_ns,
     };
 
-    if (bpf_map_update_elem(&nat64_dyn6to4, v6, &newvalue, BPF_NOEXIST) == 0) {
-        LOG("Leaking IPv4: Failed to insert mapping");
+    if ((err = bpf_map_update_elem(&nat64_dyn6to4, v6, &newvalue, BPF_NOEXIST)) == 0) {
+        LOG("Leaking IPv4: Failed to insert mapping (%d)");
         // TODO: Put address back?
         return STATUS_FAILED;
     }
@@ -450,27 +478,26 @@ static __always_inline status_t remap_v4_to_v6(struct in_addr addr, struct in6_a
 }
 
 
-static __always_inline status_t remap_v6_to_v4(struct in6_addr addr, struct in_addr *out) {
+static __always_inline status_t remap_v6_to_v4(const struct in6_addr *addr, struct in_addr *out) {
     ipv4_prefix *v4;
     ipv6_prefix v6 = {
         .len = 128,
-        .prefix = addr,
+        .prefix = *addr,
     };
     if ((v4 = bpf_map_lookup_elem(&nat64_6to4, &v6)) != NULL) {
         uint64_t mask = (0xFFFFFFFFU << (32 - v4->len)) & 0xFFFFFFFF;
         out->s_addr = htonl(
                 (ntohl(v4->prefix.s_addr) & mask)
-                | (ntohl(addr.s6_addr32[3]) & ~mask));
+                | (ntohl(addr->s6_addr32[3]) & ~mask));
         LOG("Remapped to %08x by v6 extraction",
                 ntohl(out->s_addr));
         return STATUS_SUCCESS;
     }
 
-    /* TODO: Dynamically allocate an IP address */
-    LOG("Failed to map v6 addr %08x..%08x to v4",
-            ntohl(addr.s6_addr32[0]),
-            ntohl(addr.s6_addr32[3]));
-    return STATUS_FAILED;
+    RETURN_IF_ERR(allocate_v4(addr, out, 15 * 60 * 10000000000000ULL));
+
+    LOG("Allocated dynamic v4 address %08x", ntohs(out->s_addr));
+    return STATUS_SUCCESS;
 }
 
 
@@ -484,8 +511,8 @@ static __always_inline status_t construct_v4_from_v6(__arg_nonnull const struct 
     out->ip_ttl = ip6->ip6_hlim;
     out->ip_p = (ip6->ip6_nxt == IPPROTO_ICMPV6) ? IPPROTO_ICMP : ip6->ip6_nxt;
     out->ip_sum = 0x0000;
-    RETURN_IF_ERR(remap_v6_to_v4(ip6->ip6_src, &out->ip_src));
-    RETURN_IF_ERR(remap_v6_to_v4(ip6->ip6_dst, &out->ip_dst));
+    RETURN_IF_ERR(remap_v6_to_v4(&ip6->ip6_src, &out->ip_src));
+    RETURN_IF_ERR(remap_v6_to_v4(&ip6->ip6_dst, &out->ip_dst));
     out->ip_sum = finalise_netsum(partial_netsum(out, sizeof(*out)));
 
     return STATUS_SUCCESS;
@@ -656,13 +683,12 @@ static __maybeinline status_t process_quoted_ipv4(nat64_ctx_t *ctx,
 
     uint8_t protocol = iphdr->ip_p;
 
-    struct ip6_hdr ip6;
-    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ip6));
+    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ctx->scratch->inner.ip6));
 
     /* TODO: Handle fragmented IPv4 packet */
 
     uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
-    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ctx->scratch->inner.ip6);
 
     if (UNLIKELY(iphdr->ip_v != 0x04)) {
         LOG("not ipv4: %d", iphdr->ip_v);
@@ -673,7 +699,7 @@ static __maybeinline status_t process_quoted_ipv4(nat64_ctx_t *ctx,
     /* Due to limits on minimum packet sizes imposed by the kernel, we cannot
      * do the usual pop / push for this, but instead need to do it all in place.
      */
-    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip), old_parent_netsum, &ip6, sizeof(struct ip6_hdr), new_parent_netsum));
+    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip), old_parent_netsum, &ctx->scratch->inner.ip6, sizeof(struct ip6_hdr), new_parent_netsum));
     size_t offset = sizeof(struct ip6_hdr);
 
     /* Handle any inner protocols that need handling */
@@ -713,15 +739,14 @@ static __maybeinline status_t process_quoted_ipv6(nat64_ctx_t *ctx,
 
     uint8_t protocol = ip6->ip6_nxt;
 
-    struct ip ip4;
-    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ip4));
+    RETURN_IF_ERR(construct_v4_from_v6(ip6, &ctx->scratch->inner.ip4));
 
     uint32_t old_netsum = pseudo_netsum_from_ipv6(ip6);
-    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ip4);
+    uint32_t new_netsum = pseudo_netsum_from_ipv4(&ctx->scratch->inner.ip4);
 
     /* TODO: Handle fragmented IPv4 packet */
 
-    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip6_hdr), old_parent_netsum, &ip4, sizeof(struct iphdr), new_parent_netsum));
+    RETURN_IF_ERR(replace_header(ctx->xdp, sizeof(struct ip6_hdr), old_parent_netsum, &ctx->scratch->inner.ip4, sizeof(struct iphdr), new_parent_netsum));
     size_t offset = sizeof(struct iphdr);
 
     /* Handle any inner protocols that need handling */
@@ -747,7 +772,7 @@ static __maybeinline status_t process_quoted_ipv6(nat64_ctx_t *ctx,
     }
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx->xdp, &ip4, sizeof(struct iphdr), new_parent_netsum));
+    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->inner.ip4, sizeof(struct iphdr), new_parent_netsum));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -930,13 +955,12 @@ static __maybeinline status_t process_ipv4(nat64_ctx_t *ctx) {
 
     uint8_t protocol = iphdr->ip_p;
 
-    struct ip6_hdr ip6;
-    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ip6));
+    RETURN_IF_ERR(construct_v6_from_v4(iphdr, &ctx->scratch->outer.ip6));
 
     /* TODO: Handle fragmented IPv4 packet */
 
     uint32_t old_netsum = pseudo_netsum_from_ipv4(iphdr);
-    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ip6);
+    uint32_t new_netsum = pseudo_netsum_from_ipv6(&ctx->scratch->outer.ip6);
 
     /* Strip off the old IPv4 header */
     RETURN_IF_ERR(pop_header(ctx->xdp, sizeof(struct ip), NULL));
@@ -964,10 +988,10 @@ static __maybeinline status_t process_ipv4(nat64_ctx_t *ctx) {
             LOG("Unknown IPv4 protocol %d", protocol);
     }
 
-    ip6.ip6_plen = htons(packet_len(ctx->xdp));
+    ctx->scratch->outer.ip6.ip6_plen = htons(packet_len(ctx->xdp));
 
     /* Push on the new IPv6 header */
-    RETURN_IF_ERR(push_header(ctx->xdp, &ip6, sizeof(struct ip6_hdr), NULL));
+    RETURN_IF_ERR(push_header(ctx->xdp, &ctx->scratch->outer.ip6, sizeof(struct ip6_hdr), NULL));
 
     /* Send the packet out the incoming interface */
     return STATUS_SUCCESS;
@@ -1088,11 +1112,15 @@ int xdp_nat64(__arg_ctx struct xdp_md *xdp) {
     uint32_t key = 0;
     nat64_ctx_t nat64_ctx = {
         .xdp = xdp,
+        .scratch = bpf_map_lookup_elem(&nat64_scratch, &key),
         .config = bpf_map_lookup_elem(&nat64_configmap, &key),
     };
 
+    if (nat64_ctx.scratch == NULL)
+        return XDP_PASS;
+
     if (nat64_ctx.config == NULL)
-        return XDP_DROP;
+        return XDP_PASS;
 
     switch (process_ethernet(&nat64_ctx)) {
         case STATUS_IGNORE: return nat64_ctx.config->ignore_action;

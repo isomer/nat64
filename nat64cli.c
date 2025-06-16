@@ -262,7 +262,12 @@ static bool parse_prefix(const char *st, struct sockaddr_storage *addr) {
 
 
 static bool add_dynamic(int fd, uint32_t ipv4) {
-    return bpf_map_update_elem(fd, NULL, &ipv4, BPF_ANY) == 0;
+    int err = bpf_map_update_elem(fd, NULL, &ipv4, BPF_ANY);
+    struct in_addr addr = {
+        .s_addr = ipv4,
+    };
+    printf("Add dynamic: %s %s\n", inet_ntoa(addr), strerror(-err));
+    return err == 0;
 }
 
 
@@ -386,7 +391,7 @@ int main(int argc, const char *argv[]) {
         return 1;
     }
 
-    if ((nat64_4to6_fd = bpf_map__fd(nat64_dyn4)) == -1) {
+    if ((nat64_dyn4_fd = bpf_map__fd(nat64_dyn4)) == -1) {
         fprintf(stderr, "Failed to get nat64_dyn4 fd\n");
         return 1;
     }
@@ -561,7 +566,7 @@ int main(int argc, const char *argv[]) {
                 default:
                     /* Do not include the network and broadcast address */
                     for(size_t i = 1; i < (32 - (unsigned)ipv4_prefix->sin_port); ++i)
-                        add_dynamic(nat64_dyn4_fd, htons(ntohs(ipv4_prefix->sin_addr.s_addr) + i));
+                        add_dynamic(nat64_dyn4_fd, htonl(ntohl(ipv4_prefix->sin_addr.s_addr) + i));
                     break;
             }
         } else {
