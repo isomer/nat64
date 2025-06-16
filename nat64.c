@@ -116,13 +116,14 @@ typedef struct dyn6to4_value_t {
     uint64_t expiry;
 } dyn6to4_value_t;
 
-enum { MAX_DYNAMIC_ADDRS = 20 };
+#define MAX_DYNAMIC_ADDRS 20 
 
 struct nat64_dyn6to4 {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct in6_addr);
     __type(value, dyn6to4_value_t);
     __uint(max_entries, MAX_DYNAMIC_ADDRS);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_dyn6to4 SEC(".maps");
 
 struct nat64_dyn4to6 {
@@ -130,6 +131,7 @@ struct nat64_dyn4to6 {
     __type(key, struct in_addr);
     __type(value, struct in6_addr);
     __uint(max_entries, MAX_DYNAMIC_ADDRS);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_dyn4to6 SEC(".maps");
 
 struct {
@@ -417,8 +419,8 @@ static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in
         return STATUS_FAILED;
     }
 
-    if (bpf_map_update_elem(&nat64_dyn4to6, v4, v6, BPF_ANY) == 0) {
-        LOG("Warning: Failed to set dyn4to6 mapping, ignoring");
+    if ((err = bpf_map_update_elem(&nat64_dyn4to6, v4, v6, BPF_ANY)) == 0) {
+        LOG("Warning: Failed to set dyn4to6 mapping, ignoring (%d)", err);
     }
 
     dyn6to4_value_t *value;
@@ -428,19 +430,19 @@ static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in
         return STATUS_FAILED;
     }
 
-    if (bpf_timer_init(&value->timer, &nat64_dyn6to4, CLOCK_MONOTONIC) != 0) {
-        LOG("Leaking IPv4: Failed to init timer");
+    if ((err = bpf_timer_init(&value->timer, &nat64_dyn6to4, CLOCK_MONOTONIC)) != 0) {
+        LOG("Leaking IPv4: Failed to init timer (%d)", err);
         // TODO: Put the address back on the queue?
         return STATUS_FAILED;
     }
 
-    if (bpf_timer_set_callback(&value->timer, dyn6to4_expire) != 0) {
-        LOG("Leaing IPv4: Failed to set callback?");
+    if ((err = bpf_timer_set_callback(&value->timer, dyn6to4_expire)) != 0) {
+        LOG("Leaing IPv4: Failed to set callback? (%d)", err);
         return STATUS_FAILED;
     }
 
-    if (bpf_timer_start(&value->timer, value->expiry, BPF_F_TIMER_ABS) != 0) {
-        LOG("Leaking IPv4: Failed to start timer");
+    if ((err = bpf_timer_start(&value->timer, value->expiry, BPF_F_TIMER_ABS)) != 0) {
+        LOG("Leaking IPv4: Failed to start timer (%d)", err);
         return STATUS_FAILED;
     }
 
