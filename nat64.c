@@ -116,14 +116,14 @@ typedef struct dyn6to4_value_t {
     uint64_t expiry;
 } dyn6to4_value_t;
 
-#define MAX_DYNAMIC_ADDRS 20 
+#define MAX_DYNAMIC_ADDRS 20
 
 struct nat64_dyn6to4 {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct in6_addr);
     __type(value, dyn6to4_value_t);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __uint(max_entries, MAX_DYNAMIC_ADDRS);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_dyn6to4 SEC(".maps");
 
 struct nat64_dyn4to6 {
@@ -131,7 +131,6 @@ struct nat64_dyn4to6 {
     __type(key, struct in_addr);
     __type(value, struct in6_addr);
     __uint(max_entries, MAX_DYNAMIC_ADDRS);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
 } nat64_dyn4to6 SEC(".maps");
 
 struct {
@@ -389,11 +388,15 @@ static int dyn6to4_expire(void *unused_map, struct in6_addr *key, dyn6to4_value_
             /* Don't add it to the queue for reuse if we can't remove it */
             if (bpf_map_push_elem(&nat64_dyn4, &value->v4, 0) != 0) {
                 LOG("Leaking IPv4: Couldn't add IP to free queue");
+            } else {
+                LOG("Sucessfully expired IPv4 address");
             }
         }
     } else {
         if (bpf_timer_start(&value->timer, value->expiry, BPF_F_TIMER_ABS) != 0) {
             LOG("Re-upping timer failed");
+        } else {
+            LOG("Successfully reup'd timer (%lluns remaining)", value->expiry - now);
         }
     }
     return 0;
@@ -413,13 +416,16 @@ static __always_inline status_t allocate_v4(const struct in6_addr *v6, struct in
         .expiry = bpf_ktime_get_coarse_ns() + expiry_ns,
     };
 
-    if ((err = bpf_map_update_elem(&nat64_dyn6to4, v6, &newvalue, BPF_NOEXIST)) == 0) {
-        LOG("Leaking IPv4: Failed to insert mapping (%d)");
+    if ((err = bpf_map_update_elem(&nat64_dyn6to4, v6, &newvalue, BPF_NOEXIST)) != 0) {
+        LOG("Leaking IPv4: Failed to insert mapping (%d)", err);
+        if ((err = bpf_map_delete_elem(&nat64_dyn6to4, v6)) != 0) {
+            LOG("Failed to remove old entry too (%s)", err);
+        }
         // TODO: Put address back?
         return STATUS_FAILED;
     }
 
-    if ((err = bpf_map_update_elem(&nat64_dyn4to6, v4, v6, BPF_ANY)) == 0) {
+    if ((err = bpf_map_update_elem(&nat64_dyn4to6, v4, v6, BPF_ANY)) != 0) {
         LOG("Warning: Failed to set dyn4to6 mapping, ignoring (%d)", err);
     }
 
@@ -496,9 +502,16 @@ static __always_inline status_t remap_v6_to_v4(const struct in6_addr *addr, stru
         return STATUS_SUCCESS;
     }
 
-    RETURN_IF_ERR(allocate_v4(addr, out, 15 * 60 * 10000000000000ULL));
+    dyn6to4_value_t *dynv4;
+    if ((dynv4 = bpf_map_lookup_elem(&nat64_dyn6to4, addr)) != NULL) {
+        *out = dynv4->v4;
+        LOG("Reusing allocated address %08x", htonl(out->s_addr));
+        return STATUS_SUCCESS;
+    }
 
-    LOG("Allocated dynamic v4 address %08x", ntohs(out->s_addr));
+    RETURN_IF_ERR(allocate_v4(addr, out, 1 * 60 * 1000000000ULL));
+
+    LOG("Allocated dynamic v4 address %08x", ntohl(out->s_addr));
     return STATUS_SUCCESS;
 }
 

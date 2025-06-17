@@ -559,13 +559,13 @@ int main(int argc, const char *argv[]) {
             switch(ipv4_prefix->sin_port) {
                 case 32:
                 case 31:
-                    for(size_t i = 0; i <= (32U - ipv4_prefix->sin_port); ++i) {
+                    for(size_t i = 0; i <= 1U << (32U - ipv4_prefix->sin_port); ++i) {
                         add_dynamic(nat64_dyn4_fd, htons(ntohs(ipv4_prefix->sin_addr.s_addr) + i));
                     }
                     break;
                 default:
                     /* Do not include the network and broadcast address */
-                    for(size_t i = 1; i < (32 - (unsigned)ipv4_prefix->sin_port); ++i)
+                    for(size_t i = 1; i < 1U << (32 - (unsigned)ipv4_prefix->sin_port); ++i)
                         add_dynamic(nat64_dyn4_fd, htonl(ntohl(ipv4_prefix->sin_addr.s_addr) + i));
                     break;
             }
